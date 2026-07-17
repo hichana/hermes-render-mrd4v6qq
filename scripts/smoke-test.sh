@@ -34,7 +34,17 @@ docker build --platform "${PLATFORM}" -t "${IMAGE}" . >/dev/null
 echo "==> Booting container"
 # Mirror render.yaml: Caddy owns 10000, dashboard on 10001 bound 0.0.0.0
 # (non-loopback, so the auth gate stays armed).
+#
+# --security-opt no-new-privileges / --cap-drop NET_BIND_SERVICE mimic
+# Render's runtime, which is stricter than stock `docker run`. Without
+# these, this test passes on an image that fails to boot on Render: the
+# Caddy binary shipped with cap_net_bind_service and exec'ing it as a
+# non-root user died with "unable to exec caddy: Operation not permitted"
+# in production while a stock local run was happy. Nothing here binds a
+# port below 1024, so dropping the capability costs nothing.
 docker run -d --name "${CONTAINER}" --platform "${PLATFORM}" \
+  --security-opt no-new-privileges \
+  --cap-drop NET_BIND_SERVICE \
   -e HERMES_DASHBOARD=1 \
   -e HERMES_DASHBOARD_HOST=0.0.0.0 \
   -e HERMES_DASHBOARD_PORT=10001 \

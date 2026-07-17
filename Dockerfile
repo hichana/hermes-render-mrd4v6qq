@@ -72,7 +72,23 @@ RUN chmod 0755 /etc/cont-init.d/03-render-tools /opt/render-tools/patch-config.p
 # The binary comes from the official Caddy image (static Go, no runtime
 # deps) rather than a curl|tar of a GitHub release, so the version is
 # pinned by CADDY_IMAGE and updates through the normal image flow.
-COPY --from=caddy /usr/bin/caddy /usr/bin/caddy
+#
+# `cat` rather than a plain COPY to strip the binary's file capabilities.
+# The official image ships caddy with cap_net_bind_service=ep, and the
+# security.capability xattr survives COPY. Under a restrictive runtime
+# (no-new-privileges, or a bounding set without that cap — Render is
+# stricter than stock Docker here) exec'ing a file-capability binary as a
+# non-root user fails with EPERM:
+#
+#   s6-applyuidgid: fatal: unable to exec caddy: Operation not permitted
+#
+# Caddy binds :10000, well above 1024, so it never needed the capability.
+# Copying through `cat` creates a fresh inode with no xattrs. NOTE this
+# reproduces only under such a runtime, not on stock `docker run`.
+COPY --from=caddy /usr/bin/caddy /tmp/caddy.orig
+RUN cat /tmp/caddy.orig > /usr/bin/caddy \
+ && chmod 0755 /usr/bin/caddy \
+ && rm /tmp/caddy.orig
 COPY --chown=root:root caddy/Caddyfile /etc/caddy/Caddyfile
 COPY --chown=root:root caddy/s6-rc.d/caddy /etc/s6-overlay/s6-rc.d/caddy
 # Register with the `user` bundle, alongside upstream's dashboard and
