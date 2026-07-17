@@ -19,13 +19,14 @@ The Hermes release and the skills commit are both pinned in the `Dockerfile` for
                             │ Render web service (Docker, plan: standard)  │
                             │                                              │
    you / external clients   │  ┌────────────────────────────────────────┐  │
-   ─────────HTTPS──────────►│  │  hermes dashboard (port 10000)         │  │
-                            │  │  - /api/status (healthcheck)            │  │
+   ─────────HTTPS──────────►│  │  hermes dashboard (s6 service, :10000) │  │
+                            │  │  - /api/status (healthcheck, no auth)   │  │
                             │  │  - browser UI: config / keys / chat    │  │
+                            │  │  - auth gate REQUIRED on 0.0.0.0 binds │  │
                             │  └────────────────────────────────────────┘  │
                             │                  │                           │
                             │  ┌────────────────────────────────────────┐  │
-   Telegram / Discord /  ◄──┤  │  hermes gateway run (foreground)       │  │
+   Telegram / Discord /  ◄──┤  │  hermes gateway (s6: gateway-default)  │  │
    Slack / etc. (outbound)  │  │  - registers Render MCP @ boot         │  │
    Render MCP @ mcp.render  │  │  - calls mcp_render_* tools            │  │
    ◄──────HTTPS────────────►│  │  - long-polls chat platforms           │  │
@@ -45,7 +46,11 @@ The Hermes release and the skills commit are both pinned in the `Dockerfile` for
                             └──────────────────────────────────────────────┘
 ```
 
-A single container runs both Hermes processes. The dashboard ([upstream docs](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/web-dashboard.md)) is a side-process that the upstream entrypoint backgrounds whenever `HERMES_DASHBOARD=1` is set; the gateway is the foreground PID. They share `/opt/data` and a PID namespace, which is required for the dashboard's gateway-liveness checks.
+A single container runs both Hermes processes under [s6-overlay](https://github.com/just-containers/s6-overlay), which is the image's real init (`ENTRYPOINT ["/init", "/opt/hermes/docker/main-wrapper.sh"]`). The dashboard ([upstream docs](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/web-dashboard.md)) is an s6 service that runs whenever `HERMES_DASHBOARD=1` is set. The gateway runs as the container's main program (`CMD ["gateway", "run"]`) and registers itself as the supervised `gateway-default` service, so s6 restarts it if it crashes. Both share `/opt/data`.
+
+> **Do not override the image's `ENTRYPOINT`.** Boot-time work belongs in an `/etc/cont-init.d/` hook (see [`scripts/bootstrap.sh`](scripts/bootstrap.sh), installed as `03-render-tools`). Overriding `ENTRYPOINT` is what broke the v2026.5.7 → v2026.7.7.2 upgrade: `/usr/bin/tini` is now a symlink to `/init`, so the old `tini -g -- bootstrap.sh` line became `/init -g -- …`, s6 tried to run `-g` as the main program, and the boot failed — while the container stayed up and the health check kept passing. Run [`scripts/smoke-test.sh`](scripts/smoke-test.sh) after any `HERMES_IMAGE` bump.
+
+Hermes also supports **one gateway process per profile**: each profile gets its own `/run/service/gateway-<name>` service, reconciled on every boot from that profile's `gateway_state.json` on the disk. Each runs with its own `HERMES_HOME` and its own `.env`, so per-profile settings (including port-binding platforms like LINE) stay independent.
 
 The disk holds everything that should survive a redeploy: API keys (`.env`), config (`config.yaml`), the FTS5 session database, installed skills, Honcho user models, agent memories, cron job definitions, and logs. The `render-oss/skills` bundle and the bootstrap that registers the Render MCP server are baked into the image (versioned with each deploy), not the disk.
 
@@ -116,7 +121,11 @@ You don't need any optional keys to deploy. You can fill them in via the Render 
 
 ### Protect the URL before configuring
 
-The Hermes dashboard has no built-in authentication. Anyone who knows the service URL can read and write your API keys. Before you visit the dashboard for the first time, choose how you want to protect it:
+As of the June 2026 upstream hardening, the dashboard **does** have built-in authentication, and it fails closed: on a non-loopback bind (`HERMES_DASHBOARD_HOST=0.0.0.0`, which this Blueprint sets) the auth gate engages and the dashboard *refuses to bind* unless an auth provider is registered. `HERMES_DASHBOARD_INSECURE` no longer disables it — the flag is accepted and ignored.
+
+That means a fresh deploy needs `HERMES_DASHBOARD_BASIC_AUTH_USERNAME` + `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD` (plus `HERMES_DASHBOARD_BASIC_AUTH_SECRET` to sign sessions) set from the **Environment** tab, or the dashboard won't come up and the health check will fail. They're `sync: false` in the Blueprint, so Render never overwrites them.
+
+Built-in auth is a real gate, not a substitute for thinking about exposure — the dashboard is still an admin surface holding your provider keys and a PTY into the container. Consider going further:
 
 - Put the service behind an auth gateway that verifies a bearer token, OAuth session, or trusted identity provider.
 - Keep the dashboard reachable only through a private network path, such as Tailscale.
@@ -206,7 +215,15 @@ ARG HERMES_IMAGE=docker.io/nousresearch/hermes-agent:v2026.5.7
 ARG RENDER_SKILLS_REF=1b8496570748203351f628b2ae738805ac2c23d5
 ```
 
-Bump either, commit, and push. Render won't auto-deploy (the Blueprint sets `autoDeployTrigger: off`); trigger a manual deploy from the Dashboard or the [Render CLI](https://render.com/docs/cli) on your own machine:
+Bump either, then **run the smoke test before you deploy**:
+
+```bash
+./scripts/smoke-test.sh
+```
+
+It builds the image, boots it the way Render does, and asserts the container stays up, `config.yaml` gets patched, and the gateway reaches `running`. This is not ceremony: the v2026.5.7 → v2026.7.7.2 bump broke the boot three separate ways at once (s6-overlay migration, `tini` → `/init` symlink, `gosu` removed), and *none* of them surfaced as an obvious failure — the container stayed up wedged mid-shutdown, the dashboard kept answering the health check, and Render marked the deploy live. It ran that way for 8 days. Upstream ships roughly weekly releases with ~180 commits each, so assume every bump can move the ground under the image.
+
+Then commit and push. Render won't auto-deploy (the Blueprint sets `autoDeployTrigger: off`); trigger a manual deploy from the Dashboard or the [Render CLI](https://render.com/docs/cli) on your own machine:
 
 ```bash
 render deploys create <service-id>
@@ -255,9 +272,11 @@ Check the **Events** tab for the deploy that failed, then the **Logs** tab aroun
 | Container OOM-killed                                 | Bump plan to `pro`. Playwright/Chromium is the usual culprit.                 |
 | `Permission denied` on `/opt/data/...`               | The disk was attached after a deploy that ran as a different UID. Restart the service; the entrypoint chowns `/opt/data` on boot when run as root. |
 | `Warning: Input is not a terminal (fd=0)` then `Goodbye!` when running `hermes` | Render's browser shell pipes stdin instead of allocating a PTY. Chat from the dashboard's **Chat** tab, or use `hermes chat -q "..."`, or `render ssh <service-id>` from a local terminal. |
-| `Goodbye! ⚕` in the deploy logs followed by 502s on the URL | The Dockerfile's `ENTRYPOINT` got bypassed somehow (forked the template and overrode it, or set a `dockerCommand` in `render.yaml` without the full upstream chain). The default `ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/opt/render-tools/bootstrap.sh"]` + `CMD ["gateway", "run"]` must stay intact. |
-| `Refusing to run the Hermes gateway as root` | Same root cause as above. Restore the Dockerfile's `ENTRYPOINT`/`CMD` so the upstream `entrypoint.sh` can do its `gosu` drop. |
-| Dashboard **Chat** tab shows "Chat unavailable: 1" or hangs / 500s on `/api/pty` | Two upstream bugs combined to break the Chat tab on hosted deploys: (1) [#20500](https://github.com/NousResearch/hermes-agent/issues/20500): `/opt/hermes/ui-tui/` ships root-owned but the dashboard runs as the `hermes` user, so the runtime esbuild rebuild fails with `EACCES`. (2) Separate filename mismatch: `_hermes_ink_bundle_stale()` in `hermes_cli/main.py` looks for `packages/hermes-ink/dist/ink-bundle.js`, but `@hermes/ink`'s build script (`esbuild src/entry-exports.ts --outdir=dist`) only produces `entry-exports.js`. The bundle the staleness check expects is never created, so every `/api/pty` connect runs a 28-second `npm run build` that exceeds Render's WebSocket-upgrade timeout. The Dockerfile chowns the directories AND `touch`es the two expected paths at build time so both checks short-circuit. If you've forked the template and removed those lines, restore them. |
+| `-g: not found` / `rc.init: 91:` in the boot logs, then the service behaves erratically | The image's `ENTRYPOINT` was overridden. `/usr/bin/tini` is a symlink to `/init`, so any `tini …` ENTRYPOINT becomes `/init …` and s6 runs the leftover flags as the main program. Remove the override — the image's own `ENTRYPOINT` (`/init` + `main-wrapper.sh`) plus `CMD ["gateway", "run"]` is correct. Put boot work in `/etc/cont-init.d/`. |
+| Service looks healthy but `ps` shows `s6-rc -bda change` running for days | The container is **wedged mid-shutdown**: the boot failed, s6 started tearing down, and the teardown hung waiting on a dashboard process that never exited. The dashboard keeps answering `/api/status`, so Render's health check passes and the deploy is marked live. It cannot survive a restart. Fix the boot (row above) and redeploy. |
+| `gosu: not found` in the boot logs, and no Render MCP server in `config.yaml` | `gosu` is not in the s6-based image; use `s6-setuidgid` (upstream's own `stage2-hook.sh` does). The container still comes up looking healthy, so this fails silently — [`scripts/smoke-test.sh`](scripts/smoke-test.sh) asserts the patch landed. |
+| `Refusing to bind dashboard to 0.0.0.0 — … no auth providers are registered` | Expected, and it fails closed. Set `HERMES_DASHBOARD_BASIC_AUTH_USERNAME` + `_PASSWORD` from the Environment tab. |
+| Dashboard **Chat** tab shows "Chat unavailable: 1" or hangs / 500s on `/api/pty` | `/opt/hermes/ui-tui/` and `node_modules/` still ship root-owned while the dashboard runs as `hermes` ([#20500](https://github.com/NousResearch/hermes-agent/issues/20500)), so a runtime esbuild rebuild fails with `EACCES`. The Dockerfile chowns them at build time; if you've forked and removed that line, restore it. (The old `touch ink-bundle.js` / `entry.js` workarounds are no longer needed as of v2026.7.7.2: `_hermes_ink_bundle_stale()` and `_tui_build_needed()` are gone, and the image ships a prebuilt `ui-tui/dist/entry.js`.) |
 | `mcp_render_*` tools missing from Hermes' tool list | The gateway started without `RENDER_MCP_API_KEY`. Add it under the service's **Environment** tab and click **Restart gateway** from the dashboard's Status tab. |
 | Agent says it tried to run `render <something>` and got `command not found` | Working as designed — the Render CLI is not installed in this image (see **Security: agent capabilities**). Most CLI capabilities have an MCP equivalent the agent should use instead; the rest (live log streaming, `render psql`, SSH) the user runs from their own machine. |
 | `[render-tools] config patch failed; continuing` in the boot logs | Non-fatal. The agent still runs; you just won't see the Render MCP server until you fix it. Usually means `/opt/data/config.yaml` isn't valid YAML — fix it from the dashboard or wipe it (see "Forcing a clean rebuild"). |

@@ -15,18 +15,17 @@
 ARG HERMES_IMAGE=docker.io/nousresearch/hermes-agent:v2026.7.7.2
 FROM ${HERMES_IMAGE}
 
-# Workarounds for upstream issues that prevent the dashboard's Chat tab
-# from connecting on hosted deploys. Baked into the image so the runtime
-# command stays simple. See render.yaml comments + the README for context.
-#   - chown: dashboard runs as `hermes` but ui-tui/ + node_modules/ ship root-owned
-#   - touch ink-bundle.js: short-circuits _hermes_ink_bundle_stale()
-#   - touch entry.js: bumps mtime above source .ts files so _tui_build_needed() returns False
+# The dashboard runs as `hermes`, but ui-tui/ and node_modules/ still ship
+# root-owned (upstream #20500). Without this the Chat tab's runtime esbuild
+# rebuild fails with EACCES.
+#
+# The old `touch ink-bundle.js` / `touch entry.js` workarounds are gone as of
+# v2026.7.7.2: _hermes_ink_bundle_stale() and _tui_build_needed() no longer
+# exist, and the image now ships a prebuilt ui-tui/dist/entry.js, which
+# hermes_cli/main.py treats as "the single runtime artefact" (prebuilt bundle
+# mode). Nothing reads ink-bundle.js anymore.
 USER root
-RUN chown -R hermes:hermes /opt/hermes/ui-tui /opt/hermes/node_modules \
- && mkdir -p /opt/hermes/ui-tui/packages/hermes-ink/dist /opt/hermes/ui-tui/dist \
- && touch /opt/hermes/ui-tui/packages/hermes-ink/dist/ink-bundle.js \
-          /opt/hermes/ui-tui/dist/entry.js \
- && chown -R hermes:hermes /opt/hermes/ui-tui
+RUN chown -R hermes:hermes /opt/hermes/ui-tui /opt/hermes/node_modules
 
 # Pull the official Render skill bundle from github.com/render-oss/skills
 # at a pinned commit. Mounted via skills.external_dirs at boot, so the
@@ -54,19 +53,28 @@ RUN set -eu; \
 # overlays would shadow upstream entries.
 COPY --chown=hermes:hermes skills/ /opt/render-tools/skills-local/
 
-# Boot-time wrapper: patches /opt/data/config.yaml, then hands off to
-# the upstream entrypoint chain (tini → docker/entrypoint.sh).
-COPY --chown=root:root scripts/bootstrap.sh /opt/render-tools/bootstrap.sh
+# Boot-time config patcher, installed as an s6-overlay cont-init hook.
+# Upstream ships /etc/cont-init.d/{01-hermes-setup,015-supervise-perms,
+# 02-reconcile-profiles}; hooks run in lexical order, so 03- lands after
+# the volume is chowned and $HERMES_HOME is seeded.
+COPY --chown=root:root scripts/bootstrap.sh /etc/cont-init.d/03-render-tools
 COPY --chown=root:root scripts/patch-config.py /opt/render-tools/patch-config.py
-RUN chmod 0755 /opt/render-tools/bootstrap.sh /opt/render-tools/patch-config.py
+RUN chmod 0755 /etc/cont-init.d/03-render-tools /opt/render-tools/patch-config.py
 
 # Pre-create the dir the patcher writes to so chown works cleanly on
 # first boot. The mounted disk replaces this empty dir at runtime;
 # baking it just keeps the image self-contained for any non-disk use.
 RUN install -d -o hermes -g hermes -m 0755 /opt/data
 
-# Stay as root so the bootstrap can chown the mounted /opt/data on first
-# boot, then `gosu hermes` for the config patch, then exec the upstream
-# entrypoint (which also runs as root and does its own gosu drop).
-ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/opt/render-tools/bootstrap.sh"]
+# Deliberately NO ENTRYPOINT override. The image's own ENTRYPOINT is
+# ["/init", "/opt/hermes/docker/main-wrapper.sh"] (s6-overlay): /init runs
+# the cont-init hooks (including ours, as root), starts the supervised
+# services (dashboard, per-profile gateways), then main-wrapper.sh runs
+# this CMD and drops to the hermes user via s6-setuidgid.
+#
+# Overriding ENTRYPOINT here is what broke the v2026.5.7 → v2026.7.7.2
+# upgrade: /usr/bin/tini is now a symlink to /init, so the old
+# `tini -g -- bootstrap.sh` line resolved to `/init -g -- ...` and s6 tried
+# to run `-g` as the main program (exit 127). Leave the image's own
+# ENTRYPOINT alone; put boot work in /etc/cont-init.d/ instead.
 CMD ["gateway", "run"]

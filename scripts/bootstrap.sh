@@ -1,18 +1,22 @@
 #!/bin/sh
-# Entrypoint wrapper for the render-tools image.
+# cont-init hook for the render-tools image, installed as
+# /etc/cont-init.d/03-render-tools.
 #
-# Runs as root (PID-1 child of tini). On every boot it:
+# Runs as root under s6-overlay's cont-init stage, after the upstream
+# 01-hermes-setup hook has chowned the volume and seeded $HERMES_HOME,
+# and before s6-rc starts the user services. On every boot it:
 #   1. Ensures /opt/data exists and is owned by hermes:hermes.
 #   2. Runs the config patcher as the hermes user. The patcher is
 #      idempotent: it only INSERTs the Render MCP server and the
 #      skills.external_dirs entry; it never overwrites user edits.
-#   3. Exec's the upstream entrypoint chain with the original args
-#      (default CMD is `gateway run`).
 #
-# The upstream entrypoint also chowns /opt/data and drops to the hermes
-# user via gosu for the gateway process. Our chown here is redundant in
-# the happy path but harmless, and it lets the patcher run on a fresh
-# disk that hasn't been chowned yet.
+# This hook must NOT exec the CMD. Under s6-overlay the image's own
+# ENTRYPOINT (/init + main-wrapper.sh) runs the CMD after cont-init
+# finishes, and the dashboard + per-profile gateways come up as
+# supervised s6 services. A hook that execs would pre-empt all of that.
+#
+# Privilege drop uses s6-setuidgid, not gosu: gosu is not present in the
+# s6-based image (upstream's own stage2-hook.sh uses s6-setuidgid too).
 
 set -eu
 
@@ -31,13 +35,9 @@ fi
 # can still run without the Render MCP server registered, and the user
 # can always add it manually from the dashboard.
 if [ -x "${PATCHER}" ]; then
-  if ! gosu hermes "${PATCHER}" "${DATA_DIR}/config.yaml"; then
+  if ! s6-setuidgid hermes "${PATCHER}" "${DATA_DIR}/config.yaml"; then
     echo "[render-tools] warning: config patch failed; continuing with unmodified config" >&2
   fi
 else
   echo "[render-tools] warning: ${PATCHER} not found or not executable; skipping" >&2
 fi
-
-# Hand off to the upstream entrypoint. The upstream script handles
-# privilege drop, dashboard backgrounding, and the actual gateway exec.
-exec /opt/hermes/docker/entrypoint.sh "$@"
