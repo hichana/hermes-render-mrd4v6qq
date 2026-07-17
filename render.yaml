@@ -9,12 +9,18 @@
 #   - The Render MCP server pre-registered in config.yaml at boot
 #     with the full MCP tool catalog available to the provided API key
 #
-# Inside the container the gateway runs in the foreground and the
-# dashboard runs as a background side-process (HERMES_DASHBOARD=1).
-# Render's public URL serves the dashboard on port 10000; persistent
-# state lives on a 5 GB disk mounted at /opt/data (HERMES_HOME default).
+# Inside the container, s6-overlay supervises both processes: the
+# dashboard runs as an s6 service, and the gateway runs as the container's
+# main program (registered as the supervised `gateway-default` service, so
+# it auto-restarts on crash). Render's public URL serves the dashboard on
+# port 10000; persistent state lives on a 5 GB disk mounted at /opt/data
+# (HERMES_HOME default).
 #
-# To upgrade Hermes: bump HERMES_IMAGE in the Dockerfile and redeploy.
+# To upgrade Hermes: bump HERMES_IMAGE in the Dockerfile, run
+# ./scripts/smoke-test.sh, then redeploy. Do not skip the smoke test —
+# the v2026.5.7 -> v2026.7.7.2 bump silently broke the container's boot
+# (upstream moved to s6-overlay) and the service ran wedged for 8 days
+# while still looking healthy.
 # To upgrade Render skills: bump RENDER_SKILLS_REF and redeploy.
 
 services:
@@ -24,11 +30,17 @@ services:
     region: oregon
     plan: standard
     # Render builds the image from this repo's Dockerfile on every deploy.
-    # The Dockerfile FROMs the pinned upstream Hermes image, adds Render
-    # tooling + the skill bundle, and sets ENTRYPOINT to our bootstrap wrapper — so
-    # no `dockerCommand` override is needed here.
+    # The Dockerfile FROMs the pinned upstream Hermes image and adds Render
+    # tooling + the skill bundle. It deliberately does NOT override the
+    # image's ENTRYPOINT (/init + main-wrapper.sh under s6-overlay); boot
+    # work runs as a cont-init hook instead. Leave `dockerCommand` unset —
+    # setting it replaces the Dockerfile's `CMD ["gateway", "run"]`.
     dockerfilePath: ./Dockerfile
     autoDeployTrigger: off
+    # Served by the dashboard, and reachable without auth by design (the
+    # rest of the dashboard is gated). So this probes the dashboard, NOT
+    # the gateway: a wedged container whose dashboard still answers will
+    # pass this check. See the smoke test for a real liveness assertion.
     healthCheckPath: /api/status
 
     disk:
@@ -42,16 +54,37 @@ services:
       # keys, and chat platform tokens are set through the Hermes dashboard
       # (API Keys tab), which writes them to /opt/data/.env on the disk.
 
-      # Dashboard side-process. The entrypoint backgrounds `hermes dashboard`
-      # before exec'ing `gateway run` whenever HERMES_DASHBOARD is truthy.
-      # HERMES_DASHBOARD_HOST=0.0.0.0 makes the entrypoint pass --insecure
-      # so the dashboard accepts non-loopback binds.
+      # Dashboard s6 service. Runs whenever HERMES_DASHBOARD is truthy;
+      # s6 supervises it and restarts it on crash.
+      #
+      # On a non-loopback bind (0.0.0.0, as here) the dashboard's auth gate
+      # engages and REQUIRES a registered auth provider — it refuses to bind
+      # otherwise, which fails the health check rather than exposing an
+      # unauthenticated dashboard. Set the basic-auth vars below.
+      # HERMES_DASHBOARD_INSECURE no longer disables the gate (June 2026
+      # hardening); it is accepted but ignored.
       - key: HERMES_DASHBOARD
         value: "1"
       - key: HERMES_DASHBOARD_HOST
         value: "0.0.0.0"
       - key: HERMES_DASHBOARD_PORT
         value: "10000"
+
+      # Required for a public (non-loopback) dashboard: without an auth
+      # provider the dashboard refuses to bind and the service fails its
+      # health check. Marked sync: false so they are set per-service from
+      # the Environment tab and never overwritten by a Blueprint sync.
+      #
+      # The dashboard is an admin surface: it holds your provider keys and,
+      # with HERMES_DASHBOARD_TUI=1, a PTY into the container. Anyone who
+      # reaches it can drive the agent with your RENDER_MCP_API_KEY.
+      - key: HERMES_DASHBOARD_BASIC_AUTH_USERNAME
+        sync: false
+      - key: HERMES_DASHBOARD_BASIC_AUTH_PASSWORD
+        sync: false
+      # Signing secret for dashboard sessions.
+      - key: HERMES_DASHBOARD_BASIC_AUTH_SECRET
+        sync: false
       # Exposes a Chat tab in the dashboard that embeds the full Hermes TUI
       # over a server-side PTY + xterm.js. This is how you chat with the
       # agent without a real terminal on the host side.
