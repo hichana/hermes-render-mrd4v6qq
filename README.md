@@ -348,6 +348,27 @@ Skip the public internet entirely. Run Tailscale on a sidecar (or use Render's [
 - The OpenAI-compatible API server (`API_SERVER_ENABLED=true`) is separate from the dashboard. It uses a bearer token (`API_SERVER_KEY`), so it's safe to expose with a long random key, but this Blueprint doesn't route it publicly.
 - For broader Hermes security guidance see the [upstream security doc](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/security.md).
 
+## Open question: user identity through the API server
+
+Relevant if you plan to build your own UI (a customer-facing dashboard, say) against Hermes' OpenAI-compatible API server rather than reaching the agent through a chat platform. **Unresolved — verify before you depend on it.**
+
+The two doors into the agent do not carry identity the same way:
+
+| | Chat platform (LINE, Slack, …) | API server (`/v1/chat/completions`) |
+|---|---|---|
+| Who the user is | Derived from the platform's signed payload (e.g. LINE's HMAC-verified webhook → real user ID) | **Asserted by the caller** |
+| Session scoping | Gateway keys it: `agent:main:<platform>:dm:<chat_id>` | `X-Hermes-Session-Key` header, or it collapses |
+| Honcho peer | `userPeerAliases` maps the platform user ID → a distinct peer | **Unknown — see below** |
+| Trust boundary | Hermes verifies the platform's signature | Hermes trusts your app completely |
+
+By default the API server stamps requests with a single shared channel (`"chat_id": "api"`) — there's no per-user concept. To scope memory per user you must send `X-Hermes-Session-Key`, documented in `gateway/platforms/api_server.py` as *"a stable per-channel identifier that scopes long-term memory (e.g. Honcho sessions) across transcripts."* It requires `API_SERVER_KEY` — the source is explicit that accepting a caller-supplied memory scope without authentication would let a client *"inject itself into another user's long-term memory scope by guessing a key."*
+
+**What we could not establish:** `userPeerAliases` maps *platform runtime IDs* to Honcho peers, and the API path has no platform user ID. So whether a session key yields a distinct Honcho **peer** — or merely a distinct session under one blended peer — is unverified. That's the difference between real per-user modeling and per-user transcripts, and it's precisely the blending failure Honcho's peer model exists to prevent.
+
+**To resolve:** point a test instance at a real Honcho workspace, drive two conversations through `/v1/chat/completions` with different `X-Hermes-Session-Key` values, and inspect whether Honcho records one peer or two.
+
+**Consequence either way:** your app becomes the sole guarantor of user isolation on that path, since the session key is caller-supplied. That's a fair trade — it's also what lets you implement the per-user RBAC Hermes doesn't have — but it must be deliberate.
+
 ## What this template does and doesn't do
 
 What it does:
