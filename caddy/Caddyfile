@@ -7,8 +7,11 @@
 #     public HTTPS, so it MUST be reachable from the internet.
 #   - The Hermes dashboard.
 #
-# Caddy owns :10000 and fans out by path. Both backends bind loopback only,
-# so nothing but Caddy is exposed.
+# Caddy owns :10000 and fans out by path. Render publishes no other port, so
+# the backends are unreachable from outside whatever host they bind. (The
+# dashboard deliberately binds 0.0.0.0, not loopback: its auth gate only
+# engages on non-loopback binds, and Caddy forwards the public internet to
+# it — a loopback bind would disarm the gate. See render.yaml.)
 #
 # The /line/* prefix intentionally covers all three routes the LINE adapter
 # registers (see plugins/platforms/line/adapter.py):

@@ -1,0 +1,17 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# Companion to ./run. Arguments: $1=run-exit-code, $2=signal-num.
+#
+# The run script exits 78 (EX_CONFIG) when HERMES_DASHBOARD_PORT collides
+# with Caddy's own port. That is an operator misconfiguration, not a crash:
+# restarting cannot fix it, so return 125 ("permanent failure, do not
+# restart") and let s6-svstat report the slot as down. Without this,
+# s6-supervise retries forever and buries the deploy logs in the same error
+# — which is exactly what happened on the first deploy of this service.
+#
+# Any other exit is a real crash: return non-125 so s6 restarts Caddy,
+# which is the whole point of supervising it.
+if [ "${1:-0}" = "78" ]; then
+    exit 125
+fi
+exit 0

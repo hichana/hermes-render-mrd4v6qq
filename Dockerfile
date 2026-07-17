@@ -66,7 +66,8 @@ RUN chmod 0755 /etc/cont-init.d/03-render-tools /opt/render-tools/patch-config.p
 # Path-based multiplexer for Render's single exposed port. Render routes
 # only port 10000, but the LINE adapter's webhook server must be publicly
 # reachable (LINE POSTs to it) AND the dashboard needs to stay usable.
-# Caddy owns 10000 and fans out by path; both backends bind loopback only.
+# Caddy owns 10000 and fans out by path. Render publishes no other port, so
+# the backends are unreachable from outside regardless of their bind host.
 #
 # The binary comes from the official Caddy image (static Go, no runtime
 # deps) rather than a curl|tar of a GitHub release, so the version is
@@ -77,7 +78,7 @@ COPY --chown=root:root caddy/s6-rc.d/caddy /etc/s6-overlay/s6-rc.d/caddy
 # Register with the `user` bundle, alongside upstream's dashboard and
 # main-hermes services. An empty file named after the service is how s6-rc
 # declares bundle membership.
-RUN chmod 0755 /etc/s6-overlay/s6-rc.d/caddy/run \
+RUN chmod 0755 /etc/s6-overlay/s6-rc.d/caddy/run /etc/s6-overlay/s6-rc.d/caddy/finish \
  && touch /etc/s6-overlay/s6-rc.d/user/contents.d/caddy \
  && caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 

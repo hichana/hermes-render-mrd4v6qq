@@ -8,13 +8,21 @@
 # before invoking services otherwise).
 #
 # Guard against the misconfiguration that would be hardest to debug: if the
-# dashboard is left on 10000, Caddy would bind the same port (or proxy to
-# itself). Fail loudly instead.
+# dashboard is left on 10000, Caddy would fight it for the port. Fail fast.
+#
+# Note render.yaml's value does NOT propagate to an existing Render service —
+# Render only reads render.yaml on a Blueprint sync. Change it on the
+# service's Environment tab.
+#
+# Exit 78 (EX_CONFIG), not 1: ./finish maps 78 to s6's "permanent failure,
+# do not restart" so a config error reports once instead of retry-looping
+# and burying the deploy logs. Any other exit stays restartable.
 if [ "${HERMES_DASHBOARD_PORT:-10001}" = "10000" ]; then
     echo "[caddy] ERROR: HERMES_DASHBOARD_PORT=10000 collides with Caddy." >&2
-    echo "[caddy] Caddy owns :10000 and proxies to the dashboard on a loopback" >&2
-    echo "[caddy] port. Set HERMES_DASHBOARD_PORT=10001 (see render.yaml)." >&2
-    exit 1
+    echo "[caddy] Caddy owns :10000 and proxies to the dashboard on another port." >&2
+    echo "[caddy] Set HERMES_DASHBOARD_PORT=10001 on the service's Environment tab" >&2
+    echo "[caddy] (editing render.yaml does not update an existing service)." >&2
+    exit 78
 fi
 
 exec s6-setuidgid hermes caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
