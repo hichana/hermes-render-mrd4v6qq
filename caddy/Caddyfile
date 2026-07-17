@@ -20,7 +20,6 @@
 #   GET  /line/media/<token>/<filename>    media served to LINE
 # That last one is why LINE_PUBLIC_URL works: LINE's API takes HTTPS URLs,
 # not binary uploads, and it fetches them back through this proxy.
-
 {
 	# No admin API — nothing in this container drives Caddy at runtime, and
 	# it would otherwise listen on :2019.

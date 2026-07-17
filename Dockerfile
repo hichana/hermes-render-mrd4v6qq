@@ -96,6 +96,8 @@ COPY --chown=root:root caddy/s6-rc.d/caddy /etc/s6-overlay/s6-rc.d/caddy
 # declares bundle membership.
 RUN chmod 0755 /etc/s6-overlay/s6-rc.d/caddy/run /etc/s6-overlay/s6-rc.d/caddy/finish \
  && touch /etc/s6-overlay/s6-rc.d/user/contents.d/caddy \
+ && install -d -o hermes -g hermes -m 0755 \
+      /var/lib/caddy /var/lib/caddy/.config /var/lib/caddy/.local/share \
  && caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 
 # Pre-create the dir the patcher writes to so chown works cleanly on

@@ -25,4 +25,19 @@ if [ "${HERMES_DASHBOARD_PORT:-10001}" = "10000" ]; then
     exit 78
 fi
 
+# with-contenv hands us HOME=/root (the /init context), but we drop to
+# hermes below — so Caddy tries to write its config autosave and TLS
+# storage under /root and logs a flurry of "permission denied" errors:
+#
+#   ERROR unable to create folder for config autosave {"dir": "/root/.config/caddy"}
+#   WARN  tls unable to get instance ID ... /root/.local/share/caddy/instance.uuid
+#
+# Harmless (admin off + auto_https off mean none of it is load-bearing) but
+# it buries real errors. Point HOME at a hermes-owned dir instead; upstream
+# does the same in its own service scripts. Deliberately not /opt/data —
+# this is disposable scratch, not state worth putting on the disk.
+export HOME=/var/lib/caddy
+export XDG_CONFIG_HOME=/var/lib/caddy/.config
+export XDG_DATA_HOME=/var/lib/caddy/.local/share
+
 exec s6-setuidgid hermes caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
