@@ -1,0 +1,20 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# Caddy service: owns Render's exposed port (10000) and fans out by path to
+# the LINE webhook server and the dashboard. See /etc/caddy/Caddyfile.
+#
+# with-contenv so the Caddyfile's {$LINE_PORT} / {$HERMES_DASHBOARD_PORT}
+# substitutions resolve from the container environment (/init scrubs env
+# before invoking services otherwise).
+#
+# Guard against the misconfiguration that would be hardest to debug: if the
+# dashboard is left on 10000, Caddy would bind the same port (or proxy to
+# itself). Fail loudly instead.
+if [ "${HERMES_DASHBOARD_PORT:-10001}" = "10000" ]; then
+    echo "[caddy] ERROR: HERMES_DASHBOARD_PORT=10000 collides with Caddy." >&2
+    echo "[caddy] Caddy owns :10000 and proxies to the dashboard on a loopback" >&2
+    echo "[caddy] port. Set HERMES_DASHBOARD_PORT=10001 (see render.yaml)." >&2
+    exit 1
+fi
+
+exec s6-setuidgid hermes caddy run --config /etc/caddy/Caddyfile --adapter caddyfile

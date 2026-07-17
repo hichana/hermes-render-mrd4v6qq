@@ -1,0 +1,49 @@
+# Path-based multiplexer for Render's single exposed port.
+#
+# Render routes exactly one port per web service (10000 here), but this
+# container has two HTTP listeners that both need to be publicly reachable:
+#
+#   - The LINE adapter's webhook server. LINE delivers inbound events over
+#     public HTTPS, so it MUST be reachable from the internet.
+#   - The Hermes dashboard.
+#
+# Caddy owns :10000 and fans out by path. Both backends bind loopback only,
+# so nothing but Caddy is exposed.
+#
+# The /line/* prefix intentionally covers all three routes the LINE adapter
+# registers (see plugins/platforms/line/adapter.py):
+#   POST /line/webhook                     inbound events (HMAC-verified)
+#   GET  /line/webhook/health              health probe
+#   GET  /line/media/<token>/<filename>    media served to LINE
+# That last one is why LINE_PUBLIC_URL works: LINE's API takes HTTPS URLs,
+# not binary uploads, and it fetches them back through this proxy.
+
+{
+	# No admin API — nothing in this container drives Caddy at runtime, and
+	# it would otherwise listen on :2019.
+	admin off
+	# Render terminates TLS at its edge and forwards plain HTTP. Without
+	# this, Caddy would try to provision its own certificates.
+	auto_https off
+	log {
+		output stderr
+		format console
+	}
+}
+
+:10000 {
+	handle /line/* {
+		# `handle`, not `handle_path`: the adapter serves the full /line/...
+		# path, so the prefix must be preserved rather than stripped.
+		reverse_proxy 127.0.0.1:{$LINE_PORT:8646}
+	}
+
+	# Everything else is the dashboard, including /api/status (the Render
+	# health check). reverse_proxy upgrades WebSockets automatically, which
+	# the dashboard's Chat tab needs for its PTY, and it preserves the
+	# original Host header, which the dashboard's WebSocket origin guard
+	# checks.
+	handle {
+		reverse_proxy 127.0.0.1:{$HERMES_DASHBOARD_PORT:10001}
+	}
+}

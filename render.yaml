@@ -65,10 +65,21 @@ services:
       # hardening); it is accepted but ignored.
       - key: HERMES_DASHBOARD
         value: "1"
+      # Deliberately 0.0.0.0, NOT 127.0.0.1 — even though only Caddy talks
+      # to the dashboard now.
+      #
+      # The auth gate engages on *non-loopback* binds. Caddy forwards the
+      # public internet to this dashboard, so it is public in every way that
+      # matters; binding loopback would silently disarm the gate and serve
+      # an unauthenticated dashboard (holding your provider keys and a PTY)
+      # to anyone with the URL. Render only routes port 10000, so binding
+      # 0.0.0.0 here exposes nothing extra — the port is not published.
       - key: HERMES_DASHBOARD_HOST
         value: "0.0.0.0"
+      # Must not be 10000; that is Caddy's. The caddy service refuses to
+      # start if this collides.
       - key: HERMES_DASHBOARD_PORT
-        value: "10000"
+        value: "10001"
 
       # Required for a public (non-loopback) dashboard: without an auth
       # provider the dashboard refuses to bind and the service fails its

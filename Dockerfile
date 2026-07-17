@@ -13,6 +13,8 @@
 #
 # Pin the upstream tag here. Bump and redeploy to upgrade Hermes.
 ARG HERMES_IMAGE=docker.io/nousresearch/hermes-agent:v2026.7.7.2
+ARG CADDY_IMAGE=docker.io/library/caddy:2.10-alpine
+FROM ${CADDY_IMAGE} AS caddy
 FROM ${HERMES_IMAGE}
 
 # The dashboard runs as `hermes`, but ui-tui/ and node_modules/ still ship
@@ -60,6 +62,24 @@ COPY --chown=hermes:hermes skills/ /opt/render-tools/skills-local/
 COPY --chown=root:root scripts/bootstrap.sh /etc/cont-init.d/03-render-tools
 COPY --chown=root:root scripts/patch-config.py /opt/render-tools/patch-config.py
 RUN chmod 0755 /etc/cont-init.d/03-render-tools /opt/render-tools/patch-config.py
+
+# Path-based multiplexer for Render's single exposed port. Render routes
+# only port 10000, but the LINE adapter's webhook server must be publicly
+# reachable (LINE POSTs to it) AND the dashboard needs to stay usable.
+# Caddy owns 10000 and fans out by path; both backends bind loopback only.
+#
+# The binary comes from the official Caddy image (static Go, no runtime
+# deps) rather than a curl|tar of a GitHub release, so the version is
+# pinned by CADDY_IMAGE and updates through the normal image flow.
+COPY --from=caddy /usr/bin/caddy /usr/bin/caddy
+COPY --chown=root:root caddy/Caddyfile /etc/caddy/Caddyfile
+COPY --chown=root:root caddy/s6-rc.d/caddy /etc/s6-overlay/s6-rc.d/caddy
+# Register with the `user` bundle, alongside upstream's dashboard and
+# main-hermes services. An empty file named after the service is how s6-rc
+# declares bundle membership.
+RUN chmod 0755 /etc/s6-overlay/s6-rc.d/caddy/run \
+ && touch /etc/s6-overlay/s6-rc.d/user/contents.d/caddy \
+ && caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 
 # Pre-create the dir the patcher writes to so chown works cleanly on
 # first boot. The mounted disk replaces this empty dir at runtime;

@@ -32,10 +32,12 @@ echo "==> Building ${IMAGE}"
 docker build --platform "${PLATFORM}" -t "${IMAGE}" . >/dev/null
 
 echo "==> Booting container"
+# Mirror render.yaml: Caddy owns 10000, dashboard on 10001 bound 0.0.0.0
+# (non-loopback, so the auth gate stays armed).
 docker run -d --name "${CONTAINER}" --platform "${PLATFORM}" \
   -e HERMES_DASHBOARD=1 \
   -e HERMES_DASHBOARD_HOST=0.0.0.0 \
-  -e HERMES_DASHBOARD_PORT=10000 \
+  -e HERMES_DASHBOARD_PORT=10001 \
   -e HERMES_DASHBOARD_BASIC_AUTH_USERNAME=smoke \
   -e HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=smoke-test-password \
   -e RENDER_MCP_API_KEY=smoke-test-key \
@@ -48,6 +50,7 @@ while (( SECONDS < deadline )); do
     docker logs "${CONTAINER}" 2>&1 | tail -25 >&2
     fail "container exited (entrypoint chain did not run the CMD)"
   fi
+  # Probe through Caddy on 10000, which also proves the proxy is routing.
   state="$(docker exec "${CONTAINER}" curl -s --max-time 5 http://127.0.0.1:10000/api/status 2>/dev/null \
     | sed -n 's/.*"gateway_state": *"\([^"]*\)".*/\1/p' || true)"
   [[ "${state}" == "running" ]] && break
@@ -71,8 +74,43 @@ docker exec "${CONTAINER}" grep -q "/opt/render-tools/skills-upstream" /opt/data
   || fail "config.yaml is missing skills.external_dirs"
 echo "  ok: config.yaml has skills.external_dirs"
 
-# 3. Gateway reached running.
+# 3. Gateway reached running. Probed through Caddy, so this also proves the
+#    catch-all route reaches the dashboard.
 [[ "${state}" == "running" ]] || fail "gateway_state is '${state:-unknown}', expected 'running'"
-echo "  ok: gateway_state=running"
+echo "  ok: gateway_state=running (via Caddy :10000 -> dashboard)"
 
-echo "PASS: image boots, config patched, gateway running"
+# 4. Caddy is the thing on 10000, and the dashboard is NOT publicly bound
+#    there. Guards against a future edit that puts the dashboard back on
+#    10000 and quietly drops the /line/* route.
+docker exec "${CONTAINER}" sh -c 'command -v caddy >/dev/null' \
+  || fail "caddy is not installed in the image"
+docker exec "${CONTAINER}" ps -eo args 2>/dev/null | grep -q "caddy run" \
+  || fail "caddy is not running (check the s6 service registered in the user bundle)"
+echo "  ok: caddy is running and owns :10000"
+
+# 5. The auth gate is armed. The dashboard sits behind Caddy, which forwards
+#    the public internet to it, so an unauthenticated dashboard would expose
+#    provider keys and a PTY. /api/status is deliberately open (health
+#    check); anything else must not be.
+code="$(docker exec "${CONTAINER}" curl -s -o /dev/null -w '%{http_code}' \
+  --max-time 5 http://127.0.0.1:10000/api/keys 2>/dev/null || true)"
+[[ "${code}" == "401" || "${code}" == "403" ]] \
+  || fail "dashboard auth gate is NOT armed: /api/keys returned ${code}, expected 401/403. \
+Check HERMES_DASHBOARD_HOST is non-loopback (the gate only engages on non-loopback binds)."
+echo "  ok: dashboard auth gate armed (/api/keys -> ${code})"
+
+# 6. The /line/* route reaches the LINE adapter's port, not the dashboard.
+#    LINE is not configured here, so nothing listens on 8646 and Caddy
+#    returns a 502. That is the point: a 502 proves Caddy routed to the LINE
+#    backend, whereas a 302 would mean the request fell through to the
+#    dashboard's login redirect — the exact bug this route exists to fix.
+code="$(docker exec "${CONTAINER}" curl -s -o /dev/null -w '%{http_code}' \
+  --max-time 5 http://127.0.0.1:10000/line/webhook/health 2>/dev/null || true)"
+case "${code}" in
+  502|503) echo "  ok: /line/* routes to the LINE backend (${code}; LINE not configured here)" ;;
+  200)     echo "  ok: /line/* routes to a live LINE webhook server (200)" ;;
+  30*)     fail "/line/webhook/health returned ${code} — it is hitting the DASHBOARD, not the LINE backend" ;;
+  *)       fail "/line/webhook/health returned unexpected ${code}" ;;
+esac
+
+echo "PASS: image boots, config patched, gateway running, Caddy routing, auth armed"
