@@ -54,19 +54,28 @@ RUN set -eu; \
 # overlays would shadow upstream entries.
 COPY --chown=hermes:hermes skills/ /opt/render-tools/skills-local/
 
-# Boot-time wrapper: patches /opt/data/config.yaml, then hands off to
-# the upstream entrypoint chain (tini → docker/entrypoint.sh).
-COPY --chown=root:root scripts/bootstrap.sh /opt/render-tools/bootstrap.sh
+# Boot-time config patcher, installed as an s6-overlay cont-init hook.
+# Upstream ships /etc/cont-init.d/{01-hermes-setup,015-supervise-perms,
+# 02-reconcile-profiles}; hooks run in lexical order, so 03- lands after
+# the volume is chowned and $HERMES_HOME is seeded.
+COPY --chown=root:root scripts/bootstrap.sh /etc/cont-init.d/03-render-tools
 COPY --chown=root:root scripts/patch-config.py /opt/render-tools/patch-config.py
-RUN chmod 0755 /opt/render-tools/bootstrap.sh /opt/render-tools/patch-config.py
+RUN chmod 0755 /etc/cont-init.d/03-render-tools /opt/render-tools/patch-config.py
 
 # Pre-create the dir the patcher writes to so chown works cleanly on
 # first boot. The mounted disk replaces this empty dir at runtime;
 # baking it just keeps the image self-contained for any non-disk use.
 RUN install -d -o hermes -g hermes -m 0755 /opt/data
 
-# Stay as root so the bootstrap can chown the mounted /opt/data on first
-# boot, then `gosu hermes` for the config patch, then exec the upstream
-# entrypoint (which also runs as root and does its own gosu drop).
-ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/opt/render-tools/bootstrap.sh"]
+# Deliberately NO ENTRYPOINT override. The image's own ENTRYPOINT is
+# ["/init", "/opt/hermes/docker/main-wrapper.sh"] (s6-overlay): /init runs
+# the cont-init hooks (including ours, as root), starts the supervised
+# services (dashboard, per-profile gateways), then main-wrapper.sh runs
+# this CMD and drops to the hermes user via s6-setuidgid.
+#
+# Overriding ENTRYPOINT here is what broke the v2026.5.7 → v2026.7.7.2
+# upgrade: /usr/bin/tini is now a symlink to /init, so the old
+# `tini -g -- bootstrap.sh` line resolved to `/init -g -- ...` and s6 tried
+# to run `-g` as the main program (exit 127). Leave the image's own
+# ENTRYPOINT alone; put boot work in /etc/cont-init.d/ instead.
 CMD ["gateway", "run"]
