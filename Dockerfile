@@ -15,18 +15,17 @@
 ARG HERMES_IMAGE=docker.io/nousresearch/hermes-agent:v2026.7.7.2
 FROM ${HERMES_IMAGE}
 
-# Workarounds for upstream issues that prevent the dashboard's Chat tab
-# from connecting on hosted deploys. Baked into the image so the runtime
-# command stays simple. See render.yaml comments + the README for context.
-#   - chown: dashboard runs as `hermes` but ui-tui/ + node_modules/ ship root-owned
-#   - touch ink-bundle.js: short-circuits _hermes_ink_bundle_stale()
-#   - touch entry.js: bumps mtime above source .ts files so _tui_build_needed() returns False
+# The dashboard runs as `hermes`, but ui-tui/ and node_modules/ still ship
+# root-owned (upstream #20500). Without this the Chat tab's runtime esbuild
+# rebuild fails with EACCES.
+#
+# The old `touch ink-bundle.js` / `touch entry.js` workarounds are gone as of
+# v2026.7.7.2: _hermes_ink_bundle_stale() and _tui_build_needed() no longer
+# exist, and the image now ships a prebuilt ui-tui/dist/entry.js, which
+# hermes_cli/main.py treats as "the single runtime artefact" (prebuilt bundle
+# mode). Nothing reads ink-bundle.js anymore.
 USER root
-RUN chown -R hermes:hermes /opt/hermes/ui-tui /opt/hermes/node_modules \
- && mkdir -p /opt/hermes/ui-tui/packages/hermes-ink/dist /opt/hermes/ui-tui/dist \
- && touch /opt/hermes/ui-tui/packages/hermes-ink/dist/ink-bundle.js \
-          /opt/hermes/ui-tui/dist/entry.js \
- && chown -R hermes:hermes /opt/hermes/ui-tui
+RUN chown -R hermes:hermes /opt/hermes/ui-tui /opt/hermes/node_modules
 
 # Pull the official Render skill bundle from github.com/render-oss/skills
 # at a pinned commit. Mounted via skills.external_dirs at boot, so the
