@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# Boot smoke test for the render-tools image.
+# Boot smoke test for the hermes-render image.
 #
 # Builds the image and boots it the way Render does, then asserts the
-# three things that must hold for a deploy to be healthy:
+# things that must hold for a deploy to be healthy:
 #
 #   1. The container stays up (the entrypoint chain actually runs the CMD).
-#   2. Our cont-init hook patched config.yaml (Render MCP registered).
-#   3. The gateway reaches the running state.
+#   2. The gateway reaches the running state.
 #
 # Run this after bumping HERMES_IMAGE, before deploying. The
 # v2026.5.7 → v2026.7.7.2 bump broke all three at once — silently, in
@@ -50,7 +49,6 @@ docker run -d --name "${CONTAINER}" --platform "${PLATFORM}" \
   -e HERMES_DASHBOARD_PORT=10001 \
   -e HERMES_DASHBOARD_BASIC_AUTH_USERNAME=smoke \
   -e HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=smoke-test-password \
-  -e RENDER_MCP_API_KEY=smoke-test-key \
   "${IMAGE}" >/dev/null
 
 echo "==> Waiting for gateway (up to ${BOOT_TIMEOUT}s)"
@@ -72,24 +70,12 @@ docker ps --filter "name=${CONTAINER}" --format '{{.Names}}' | grep -q "${CONTAI
   || fail "container is not running"
 echo "  ok: container is up"
 
-# 2. cont-init hook ran and patched config.yaml. Checked independently of
-#    the log line, since a failed privilege drop (e.g. gosu removed
-#    upstream) still lets the container look healthy.
-docker exec "${CONTAINER}" grep -q "mcp.render.com" /opt/data/config.yaml \
-  || { docker logs "${CONTAINER}" 2>&1 | grep -i 'render-tools' >&2 || true
-       fail "config.yaml is missing the Render MCP server (cont-init hook did not patch)"; }
-echo "  ok: config.yaml has the Render MCP server"
-
-docker exec "${CONTAINER}" grep -q "/opt/render-tools/skills-upstream" /opt/data/config.yaml \
-  || fail "config.yaml is missing skills.external_dirs"
-echo "  ok: config.yaml has skills.external_dirs"
-
-# 3. Gateway reached running. Probed through Caddy, so this also proves the
+# 2. Gateway reached running. Probed through Caddy, so this also proves the
 #    catch-all route reaches the dashboard.
 [[ "${state}" == "running" ]] || fail "gateway_state is '${state:-unknown}', expected 'running'"
 echo "  ok: gateway_state=running (via Caddy :10000 -> dashboard)"
 
-# 4. Caddy is the thing on 10000, and the dashboard is NOT publicly bound
+# 3. Caddy is the thing on 10000, and the dashboard is NOT publicly bound
 #    there. Guards against a future edit that puts the dashboard back on
 #    10000 and quietly drops the /line/* route.
 docker exec "${CONTAINER}" sh -c 'command -v caddy >/dev/null' \
@@ -98,7 +84,7 @@ docker exec "${CONTAINER}" ps -eo args 2>/dev/null | grep -q "caddy run" \
   || fail "caddy is not running (check the s6 service registered in the user bundle)"
 echo "  ok: caddy is running and owns :10000"
 
-# 5. The auth gate is armed. The dashboard sits behind Caddy, which forwards
+# 4. The auth gate is armed. The dashboard sits behind Caddy, which forwards
 #    the public internet to it, so an unauthenticated dashboard would expose
 #    provider keys and a PTY. /api/status is deliberately open (health
 #    check); anything else must not be.
@@ -109,7 +95,7 @@ code="$(docker exec "${CONTAINER}" curl -s -o /dev/null -w '%{http_code}' \
 Check HERMES_DASHBOARD_HOST is non-loopback (the gate only engages on non-loopback binds)."
 echo "  ok: dashboard auth gate armed (/api/keys -> ${code})"
 
-# 6. The /line/* route reaches the LINE adapter's port, not the dashboard.
+# 5. The /line/* route reaches the LINE adapter's port, not the dashboard.
 #    LINE is not configured here, so nothing listens on 8646 and Caddy
 #    returns a 502. That is the point: a 502 proves Caddy routed to the LINE
 #    backend, whereas a 302 would mean the request fell through to the
@@ -123,4 +109,4 @@ case "${code}" in
   *)       fail "/line/webhook/health returned unexpected ${code}" ;;
 esac
 
-echo "PASS: image boots, config patched, gateway running, Caddy routing, auth armed"
+echo "PASS: image boots, gateway running, Caddy routing, auth armed"

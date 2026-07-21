@@ -1,16 +1,14 @@
-# Hermes Agent on Render, pre-baked with Render tools
+# Hermes Agent on Render
 
-Deploy [Hermes Agent](https://github.com/NousResearch/hermes-agent) (the self-improving AI agent from Nous Research) on Render as a single Docker web service, **already wired up to your Render account**. The image extends the upstream Hermes container with:
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) (the self-improving AI agent from Nous Research) on Render as a single Docker web service. This is our agent harnes for building out agent platforms for clients.
 
-- The [Render MCP server](https://render.com/docs/mcp-server) registered in `config.yaml` at boot, so MCP tools appear as `mcp_render_list_services`, `mcp_render_get_metrics`, `mcp_render_list_logs`, etc. The agent gets the full MCP tool catalog that your API key can use.
-- The official [render-oss/skills](https://github.com/render-oss/skills) bundle (22 Render skills) pinned at a commit and exposed via `skills.external_dirs`.
-- A `render-on-hermes` overlay skill that tells the agent the MCP server is already wired up, that the CLI is not installed, and how to behave when an upstream skill expects either.
+The initial instance was bootstrapped from [HERE](https://render.com/deploy-template/api/github/start?template_repo=hermes-render).
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy-template/api/github/start?template_repo=hermes-render)
+The Hermes release is pinned in the `Dockerfile` for reproducible deploys. All Hermes state lives on a persistent disk so upgrades stay non-destructive, and the dashboard at the service URL is the primary setup surface.
 
-The Hermes release and the skills commit are both pinned in the `Dockerfile` for reproducible deploys. All Hermes state lives on a persistent disk so upgrades stay non-destructive, and the dashboard at the service URL is the primary setup surface.
+This template deliberately carries no Render account access: no Render MCP server, no Render API key, no `render` CLI. Each deployed instance is a client-facing agent, and only admins provision or manage Render resources — done directly via the Render dashboard or CLI, never through a deployed agent.
 
-> **Use at your own risk:** The agent can use every Render MCP tool allowed by `RENDER_MCP_API_KEY`, including tools that mutate resources. Lock down dashboard access and use the least-privileged Render account you can.
+> **Use at your own risk:** Hermes' dashboard holds your LLM provider keys and, with `HERMES_DASHBOARD_TUI=1`, a PTY into the container. Lock down dashboard access.
 
 ## Architecture
 
@@ -27,9 +25,7 @@ The Hermes release and the skills commit are both pinned in the `Dockerfile` for
                             │                  │                           │
                             │  ┌────────────────────────────────────────┐  │
    Telegram / Discord /  ◄──┤  │  hermes gateway (s6: gateway-default)  │  │
-   Slack / etc. (outbound)  │  │  - registers Render MCP @ boot         │  │
-   Render MCP @ mcp.render  │  │  - calls mcp_render_* tools            │  │
-   ◄──────HTTPS────────────►│  │  - long-polls chat platforms           │  │
+   Slack / etc. (outbound)  │  │  - long-polls chat platforms           │  │
                             │  │  - spawns subagents per task           │  │
                             │  └────────────────────────────────────────┘  │
                             │                  │                           │
@@ -39,48 +35,16 @@ The Hermes release and the skills commit are both pinned in the `Dockerfile` for
                             │  │  .env, config.yaml, sessions/,         │  │
                             │  │  skills/, memories/, logs/             │  │
                             │  └────────────────────────────────────────┘  │
-                            │                                              │
-                            │  Image-baked, read-only:                     │
-                            │   /opt/render-tools/skills-upstream (skills) │
-                            │   /opt/render-tools/skills-local    (overlay)│
                             └──────────────────────────────────────────────┘
 ```
 
 A single container runs both Hermes processes under [s6-overlay](https://github.com/just-containers/s6-overlay), which is the image's real init (`ENTRYPOINT ["/init", "/opt/hermes/docker/main-wrapper.sh"]`). The dashboard ([upstream docs](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/web-dashboard.md)) is an s6 service that runs whenever `HERMES_DASHBOARD=1` is set. The gateway runs as the container's main program (`CMD ["gateway", "run"]`) and registers itself as the supervised `gateway-default` service, so s6 restarts it if it crashes. Both share `/opt/data`.
 
-> **Do not override the image's `ENTRYPOINT`.** Boot-time work belongs in an `/etc/cont-init.d/` hook (see [`scripts/bootstrap.sh`](scripts/bootstrap.sh), installed as `03-render-tools`). Overriding `ENTRYPOINT` is what broke the v2026.5.7 → v2026.7.7.2 upgrade: `/usr/bin/tini` is now a symlink to `/init`, so the old `tini -g -- bootstrap.sh` line became `/init -g -- …`, s6 tried to run `-g` as the main program, and the boot failed — while the container stayed up and the health check kept passing. Run [`scripts/smoke-test.sh`](scripts/smoke-test.sh) after any `HERMES_IMAGE` bump.
+> **Do not override the image's `ENTRYPOINT`.** Boot-time work belongs in an `/etc/cont-init.d/` hook. Overriding `ENTRYPOINT` is what broke the v2026.5.7 → v2026.7.7.2 upgrade: `/usr/bin/tini` is now a symlink to `/init`, so an old `tini -g -- ...` ENTRYPOINT resolved to `/init -g -- …`, s6 tried to run `-g` as the main program, and the boot failed — while the container stayed up and the health check kept passing. Run [`scripts/smoke-test.sh`](scripts/smoke-test.sh) after any `HERMES_IMAGE` bump.
 
 Hermes also supports **one gateway process per profile**: each profile gets its own `/run/service/gateway-<name>` service, reconciled on every boot from that profile's `gateway_state.json` on the disk. Each runs with its own `HERMES_HOME` and its own `.env`, so per-profile settings (including port-binding platforms like LINE) stay independent.
 
-The disk holds everything that should survive a redeploy: API keys (`.env`), config (`config.yaml`), the FTS5 session database, installed skills, Honcho user models, agent memories, cron job definitions, and logs. The `render-oss/skills` bundle and the bootstrap that registers the Render MCP server are baked into the image (versioned with each deploy), not the disk.
-
-## What's pre-baked for Render
-
-The `Dockerfile` adds two layers on top of `nousresearch/hermes-agent`:
-
-| Layer | Path in container | Source | Pinned via |
-|---|---|---|---|
-| Render skill bundle | `/opt/render-tools/skills-upstream/` | [render-oss/skills](https://github.com/render-oss/skills) tarball | `RENDER_SKILLS_REF` ARG (commit SHA) |
-| Hermes-on-Render overlay | `/opt/render-tools/skills-local/` | [`./skills/`](./skills) in this repo | This repo's commits |
-
-On every boot, [`scripts/bootstrap.sh`](scripts/bootstrap.sh) runs an idempotent patcher ([`scripts/patch-config.py`](scripts/patch-config.py)) that adds two entries to `/opt/data/config.yaml` if they're missing:
-
-```yaml
-mcp_servers:
-  render:
-    url: https://mcp.render.com/mcp
-    headers:
-      Authorization: "Bearer ${RENDER_MCP_API_KEY}"
-
-skills:
-  external_dirs:
-    - /opt/render-tools/skills-local
-    - /opt/render-tools/skills-upstream
-```
-
-The patcher is **insert-only**: it never overwrites edits you make from the dashboard. The `${RENDER_MCP_API_KEY}` placeholder is resolved lazily at gateway startup, so you can rotate the key from Render's **Environment** tab without rebuilding the image — just restart the service.
-
-> **Why `RENDER_MCP_API_KEY` and not `RENDER_API_KEY`?** The standard name is what the `render` CLI looks for. We deliberately don't ship the CLI in this image (see **Security: agent capabilities**). This is still a normal Render API key with the permissions of the user who created it. The nonstandard env var name avoids accidental CLI auto-auth if you later install the CLI manually. Name your CLI key separately.
+The disk holds everything that should survive a redeploy: API keys (`.env`), config (`config.yaml`), the FTS5 session database, installed skills, Honcho user models, agent memories, cron job definitions, and logs.
 
 ## Prerequisites
 
@@ -91,17 +55,11 @@ You need:
 
 Optional, depending on which channels you want Hermes to listen on:
 
-- **A Render API key**, if you want the bundled MCP server to inspect or manage Render resources. Generate one at [`dashboard.render.com/u/*/settings#api-keys`](https://dashboard.render.com/u/*/settings#api-keys) and paste it as `RENDER_MCP_API_KEY`. The agent runs without it, but can't see anything on your Render account.
 - **Telegram bot token** from [@BotFather](https://t.me/BotFather), plus your Telegram user ID from [@userinfobot](https://t.me/userinfobot).
 - **Discord bot token** from [discord.com/developers/applications](https://discord.com/developers/applications) (enable the Message Content Intent).
 - **Slack bot + app-level tokens** from [api.slack.com/apps](https://api.slack.com/apps) (Socket Mode requires both `xoxb-...` and `xapp-...`).
 
-> [!WARNING]
-> **A Render API key can expose every workspace linked to your account.**
->
-> Hermes can use the key through MCP to inspect any workspace the key's owner can access. Some MCP tools can mutate resources today, and more write-capable tools may be added over time. Use a dedicated low-privilege Render user when possible, and do not paste a personal Owner key unless you accept that risk.
-
-You don't need any optional keys to deploy. You can fill them in via the Render Dashboard after the service is up. `RENDER_MCP_API_KEY` is gated behind `sync: false` in the Blueprint, so the **Deploy to Render** flow will prompt for it.
+You don't need any optional keys to deploy. You can fill them in via the Render Dashboard after the service is up.
 
 ## Deploy
 
@@ -109,9 +67,8 @@ You don't need any optional keys to deploy. You can fill them in via the Render 
 
 1. Click the **Deploy to Render** button above.
 2. Pick a workspace and a service name.
-3. Optionally paste your `RENDER_MCP_API_KEY` when prompted, or leave it blank and add it later from the Environment tab. The agent works without it, just without Render tools.
-4. Render reads `render.yaml`, generates a value for `HERMES_GATEWAY_TOKEN`, and creates the service. All other env vars start blank.
-5. The first deploy builds the image from the `Dockerfile`. Expect ~3 to 5 minutes for the upstream pull (~2.6 GB compressed) plus our thin Render tooling and skills layers, then ~1 minute for the gateway to boot.
+3. Render reads `render.yaml`, generates a value for `HERMES_GATEWAY_TOKEN`, and creates the service. All other env vars start blank.
+4. The first deploy builds the image from the `Dockerfile`. Expect ~3 to 5 minutes for the upstream pull (~2.6 GB compressed) plus our thin tooling layer, then ~1 minute for the gateway to boot.
 
 ### Option 2: Manual Blueprint sync
 
@@ -149,19 +106,7 @@ Walk through these tabs in order:
 3. **Status**. Confirm the gateway is running and the model is reachable. The "Connected platforms" list will be empty until you add a chat platform.
 4. **API Keys** again, optionally. If you want a chat gateway, add the matching tokens: `TELEGRAM_BOT_TOKEN`, `DISCORD_BOT_TOKEN`, `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN`, etc. Use the **Restart gateway** button on the Status tab so the new tokens are picked up.
 
-If you'd rather set keys from the Render Dashboard's **Environment** tab (handy for CI or secrets-manager workflows), that path also works: Render env vars override `/opt/data/.env` at process start. Pick one path and stick with it to avoid drift. **The two `RENDER_*` variables are the exception** — set them from the Render **Environment** tab (not the Hermes dashboard's API Keys tab), since `config.yaml` reads `${RENDER_MCP_API_KEY}` from the gateway process environment.
-
-### Verify the Render tools are wired up
-
-From the dashboard's **Chat** tab, ask Hermes to verify the tools:
-
-```
-What Render services are running in my account?
-```
-
-The agent should call `mcp_render_list_services` and respond with the list. If it instead tells you "I don't have access to Render tools" or similar, the gateway didn't see `RENDER_MCP_API_KEY` at startup — set it under **Environment** and click **Restart gateway** on the Status tab.
-
-Before you ask the agent to mutate Render resources, read the **Security: agent capabilities** section below. The agent can use every Render MCP tool allowed by your API key.
+If you'd rather set keys from the Render Dashboard's **Environment** tab (handy for CI or secrets-manager workflows), that path also works: Render env vars override `/opt/data/.env` at process start. Pick one path and stick with it to avoid drift.
 
 ### Where the "gateway token" fits
 
@@ -208,20 +153,19 @@ LLM costs are separate and depend entirely on your provider and usage. OpenRoute
 
 ## Updating
 
-Both pinned versions live in the [`Dockerfile`](Dockerfile) as build args:
+The pinned Hermes version lives in the [`Dockerfile`](Dockerfile) as a build arg:
 
 ```dockerfile
 ARG HERMES_IMAGE=docker.io/nousresearch/hermes-agent:v2026.5.7
-ARG RENDER_SKILLS_REF=1b8496570748203351f628b2ae738805ac2c23d5
 ```
 
-Bump either, then **run the smoke test before you deploy**:
+Bump it, then **run the smoke test before you deploy**:
 
 ```bash
 ./scripts/smoke-test.sh
 ```
 
-It builds the image, boots it the way Render does, and asserts the container stays up, `config.yaml` gets patched, and the gateway reaches `running`. This is not ceremony: the v2026.5.7 → v2026.7.7.2 bump broke the boot three separate ways at once (s6-overlay migration, `tini` → `/init` symlink, `gosu` removed), and *none* of them surfaced as an obvious failure — the container stayed up wedged mid-shutdown, the dashboard kept answering the health check, and Render marked the deploy live. It ran that way for 8 days. Upstream ships roughly weekly releases with ~180 commits each, so assume every bump can move the ground under the image.
+It builds the image, boots it the way Render does, and asserts the container stays up and the gateway reaches `running`. This is not ceremony: the v2026.5.7 → v2026.7.7.2 bump broke the boot three separate ways at once (s6-overlay migration, `tini` → `/init` symlink, `gosu` removed), and *none* of them surfaced as an obvious failure — the container stayed up wedged mid-shutdown, the dashboard kept answering the health check, and Render marked the deploy live. It ran that way for 8 days. Upstream ships roughly weekly releases with ~180 commits each, so assume every bump can move the ground under the image.
 
 Then commit and push. Render won't auto-deploy (the Blueprint sets `autoDeployTrigger: off`); trigger a manual deploy from the Dashboard or the [Render CLI](https://render.com/docs/cli) on your own machine:
 
@@ -229,9 +173,9 @@ Then commit and push. Render won't auto-deploy (the Blueprint sets `autoDeployTr
 render deploys create <service-id>
 ```
 
-Your `/opt/data` disk is untouched across image upgrades. The upstream entrypoint runs a manifest-based `skills_sync.py` on each boot, which preserves edits to bundled Hermes skills. The `render-oss/skills` bundle and the `render-on-hermes` overlay live under `/opt/render-tools/` (read-only image layer), so they're replaced wholesale on every new build and never touch the disk.
+Your `/opt/data` disk is untouched across image upgrades. The upstream entrypoint runs a manifest-based `skills_sync.py` on each boot, which preserves edits to bundled Hermes skills.
 
-Hermes ships fast: roughly weekly tagged releases, each with around 180 commits. Check [the upstream releases page](https://github.com/NousResearch/hermes-agent/releases) before bumping `HERMES_IMAGE`. The [skills repo's commit log](https://github.com/render-oss/skills/commits/main) is the source of truth for `RENDER_SKILLS_REF`.
+Hermes ships fast: roughly weekly tagged releases, each with around 180 commits. Check [the upstream releases page](https://github.com/NousResearch/hermes-agent/releases) before bumping `HERMES_IMAGE`.
 
 ## Troubleshooting
 
@@ -274,12 +218,8 @@ Check the **Events** tab for the deploy that failed, then the **Logs** tab aroun
 | `Warning: Input is not a terminal (fd=0)` then `Goodbye!` when running `hermes` | Render's browser shell pipes stdin instead of allocating a PTY. Chat from the dashboard's **Chat** tab, or use `hermes chat -q "..."`, or `render ssh <service-id>` from a local terminal. |
 | `-g: not found` / `rc.init: 91:` in the boot logs, then the service behaves erratically | The image's `ENTRYPOINT` was overridden. `/usr/bin/tini` is a symlink to `/init`, so any `tini …` ENTRYPOINT becomes `/init …` and s6 runs the leftover flags as the main program. Remove the override — the image's own `ENTRYPOINT` (`/init` + `main-wrapper.sh`) plus `CMD ["gateway", "run"]` is correct. Put boot work in `/etc/cont-init.d/`. |
 | Service looks healthy but `ps` shows `s6-rc -bda change` running for days | The container is **wedged mid-shutdown**: the boot failed, s6 started tearing down, and the teardown hung waiting on a dashboard process that never exited. The dashboard keeps answering `/api/status`, so Render's health check passes and the deploy is marked live. It cannot survive a restart. Fix the boot (row above) and redeploy. |
-| `gosu: not found` in the boot logs, and no Render MCP server in `config.yaml` | `gosu` is not in the s6-based image; use `s6-setuidgid` (upstream's own `stage2-hook.sh` does). The container still comes up looking healthy, so this fails silently — [`scripts/smoke-test.sh`](scripts/smoke-test.sh) asserts the patch landed. |
 | `Refusing to bind dashboard to 0.0.0.0 — … no auth providers are registered` | Expected, and it fails closed. Set `HERMES_DASHBOARD_BASIC_AUTH_USERNAME` + `_PASSWORD` from the Environment tab. |
 | Dashboard **Chat** tab shows "Chat unavailable: 1" or hangs / 500s on `/api/pty` | `/opt/hermes/ui-tui/` and `node_modules/` still ship root-owned while the dashboard runs as `hermes` ([#20500](https://github.com/NousResearch/hermes-agent/issues/20500)), so a runtime esbuild rebuild fails with `EACCES`. The Dockerfile chowns them at build time; if you've forked and removed that line, restore it. (The old `touch ink-bundle.js` / `entry.js` workarounds are no longer needed as of v2026.7.7.2: `_hermes_ink_bundle_stale()` and `_tui_build_needed()` are gone, and the image ships a prebuilt `ui-tui/dist/entry.js`.) |
-| `mcp_render_*` tools missing from Hermes' tool list | The gateway started without `RENDER_MCP_API_KEY`. Add it under the service's **Environment** tab and click **Restart gateway** from the dashboard's Status tab. |
-| Agent says it tried to run `render <something>` and got `command not found` | Working as designed — the Render CLI is not installed in this image (see **Security: agent capabilities**). Most CLI capabilities have an MCP equivalent the agent should use instead; the rest (live log streaming, `render psql`, SSH) the user runs from their own machine. |
-| `[render-tools] config patch failed; continuing` in the boot logs | Non-fatal. The agent still runs; you just won't see the Render MCP server until you fix it. Usually means `/opt/data/config.yaml` isn't valid YAML — fix it from the dashboard or wipe it (see "Forcing a clean rebuild"). |
 | `tirith security scanner enabled but not available`  | Harmless. Tirith is an optional Rust-based command scanner; without it, Hermes uses pattern matching. Ignore unless you specifically want native scanning. |
 
 ### Changing env vars
@@ -298,37 +238,9 @@ Or restore the most recent automatic disk snapshot from the **Disks** page.
 
 ## Security
 
-There are two distinct security surfaces in this template, and they compound:
-
-1. **Dashboard auth.** Hermes' web dashboard has no authentication. Anyone who reaches the URL can read your provider keys, change configuration, and chat with the agent.
-2. **Agent capabilities.** The agent has access to a Render workspace API key via MCP. Depending on that key's role, it can restart services, change env vars, trigger deploys, and run SQL against Render Postgres.
-
-The two compose into a worst case: an unauthenticated user reaches the dashboard, chats with the agent, and asks it to "delete all services in this workspace." This template registers the full Render MCP tool catalog and **does not install the `render` CLI**. The dashboard lock is on you.
-
-### Agent capabilities
-
-The agent can reach Render through MCP. The boot-time patcher registers `mcp_servers.render` without a `tools.include` filter, so Hermes sees every tool exposed by the Render MCP server. The effective permission boundary is the Render role behind `RENDER_MCP_API_KEY`, across every workspace that key can access.
-
-This is intentionally permissive. It avoids tool visibility surprises, but it means the agent can call write-capable tools when the API key allows them. Even if most MCP usage is read-oriented today, treat the dashboard URL and API key like an admin surface.
-
-#### Why we don't ship the Render CLI
-
-The [`render` CLI](https://render.com/docs/cli) is useful for local operator workflows, but this image does not install it. MCP is the supported in-container Render integration. If you need the CLI, install it deliberately and inspect any installer before running it.
-
-The variable bound in the gateway environment is named `RENDER_MCP_API_KEY` rather than the stock `RENDER_API_KEY` so a manually installed CLI does not auto-authenticate from this var. This does not create a different kind of API key. The Render account role behind the key limits agent capabilities.
-
-This trade-off is worth revisiting once Render adds scoped API keys. A read-only-scoped key for routine inspection and a write-scoped key for deliberate actions would be a better posture.
-
-#### Concrete steps to harden further
-
-- **Scope the API key with a workspace member role.** Create a separate Render workspace member with the minimum role you need and use that user's API key for `RENDER_MCP_API_KEY` instead of an Owner key. The agent inherits whatever role the key grants. This is the closest thing to scoped keys available today.
-- **Lock the dashboard.** Put authentication or private-network access in front of the service. Without that, anyone reaching the URL can ask the agent to do anything within whatever caps you've set above.
-
-The bundled `render-on-hermes` overlay skill tells the agent that MCP is already configured and that CLI installation is not an automatic fallback. But **do not rely on agent-side guardrails for safety**. An LLM cannot meaningfully self-restrict. Dashboard access control and a least-privileged API key are the real defenses.
+Hermes' web dashboard has no built-in authentication of its own (the Blueprint arms one via `HERMES_DASHBOARD_BASIC_AUTH_*`, see "Protect the URL before configuring"). Anyone who reaches an unlocked dashboard can read your LLM provider keys, change configuration, and chat with the agent — with `HERMES_DASHBOARD_TUI=1`, that includes a PTY into the container. This template deliberately does not give the agent any Render account access (no MCP server, no API key, no CLI), so the blast radius of an exposed dashboard stops at this one service — it can't reach into your broader Render account. The dashboard lock is still on you.
 
 ### Dashboard access
-
-Even if the Render API key cannot mutate resources, the dashboard still leaks your LLM provider keys to whoever reaches it. Anyone who can chat with the agent can ask it to do anything the API key allows. Lock the dashboard down before pasting any keys.
 
 Two practical options.
 
@@ -373,22 +285,19 @@ By default the API server stamps requests with a single shared channel (`"chat_i
 
 What it does:
 
-- Pins a specific upstream Hermes image and `render-oss/skills` commit for reproducible deploys.
+- Pins a specific upstream Hermes image for reproducible deploys.
 - Runs the Hermes gateway and dashboard inside one container, the way upstream supports.
 - Mounts a persistent disk at the upstream-default `HERMES_HOME` path.
-- Bakes the official Render skill bundle into the image, plus a small `render-on-hermes` overlay skill that tells the agent how to behave on this host.
-- Idempotently patches `config.yaml` on each boot to register the Render MCP server with the full MCP tool catalog available to your API key, without overwriting your edits.
-- Generates a `HERMES_GATEWAY_TOKEN` and marks `RENDER_MCP_API_KEY` as `sync: false` so secrets never sync from the repo.
+- Generates a `HERMES_GATEWAY_TOKEN` so secrets never sync from the repo.
 - Sets a healthcheck that probes the dashboard.
 
 What it deliberately doesn't do:
 
-- **It doesn't install the `render` CLI.** MCP is the supported in-container Render integration. Install the CLI only as a deliberate operator choice.
+- **It doesn't give the agent any Render account access.** No Render MCP server, no Render API key, no `render` CLI. Provisioning and managing Render resources is an admin-only action taken outside the deployed agent.
 - It doesn't try to add authentication on top of the dashboard. Use an auth gateway, private network path, or another access-control layer you trust.
 - It doesn't enable the OpenAI-compatible API server. Flip `API_SERVER_ENABLED=true` and supply `API_SERVER_KEY` if you need it.
 - It doesn't ship a default model. Hermes' upstream default is set in `config.yaml`, which lives on disk and is owner-configurable from the dashboard.
 - It doesn't configure browser automation tweaks (`--shm-size`, GPU access). Those need an instance type with more RAM, not extra Render config.
-- It doesn't fork or modify the upstream `render-oss/skills` content. The overlay in `skills/render-on-hermes/` is the only Hermes-specific addition; everything else is the canonical Render skill bundle.
 
 ## License
 
