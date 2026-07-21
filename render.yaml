@@ -1,13 +1,13 @@
 # yaml-language-server: $schema=https://render.com/schema/render.yaml.json
 #
-# Hermes Agent on Render, pre-baked with Render tools.
+# Hermes Agent on Render.
 # https://github.com/NousResearch/hermes-agent
 #
 # Single web service built from the local Dockerfile, which extends the
-# upstream Hermes image with:
-#   - The official render-oss/skills bundle, pinned at a commit
-#   - The Render MCP server pre-registered in config.yaml at boot
-#     with the full MCP tool catalog available to the provided API key
+# upstream Hermes image with a Caddy path multiplexer for Render's single
+# exposed port. This image carries no Render account access — provisioning
+# and managing Render resources is an admin-only action taken outside the
+# deployed agent.
 #
 # Inside the container, s6-overlay supervises both processes: the
 # dashboard runs as an s6 service, and the gateway runs as the container's
@@ -21,7 +21,6 @@
 # the v2026.5.7 -> v2026.7.7.2 bump silently broke the container's boot
 # (upstream moved to s6-overlay) and the service ran wedged for 8 days
 # while still looking healthy.
-# To upgrade Render skills: bump RENDER_SKILLS_REF and redeploy.
 
 services:
   - type: web
@@ -30,8 +29,8 @@ services:
     region: oregon
     plan: standard
     # Render builds the image from this repo's Dockerfile on every deploy.
-    # The Dockerfile FROMs the pinned upstream Hermes image and adds Render
-    # tooling + the skill bundle. It deliberately does NOT override the
+    # The Dockerfile FROMs the pinned upstream Hermes image and adds the
+    # Caddy path multiplexer. It deliberately does NOT override the
     # image's ENTRYPOINT (/init + main-wrapper.sh under s6-overlay); boot
     # work runs as a cont-init hook instead. Leave `dockerCommand` unset —
     # setting it replaces the Dockerfile's `CMD ["gateway", "run"]`.
@@ -49,10 +48,10 @@ services:
       sizeGB: 5
 
     envVars:
-      # The Blueprint only carries vars that change how the container boots
-      # or that wire up the bundled Render tools. All provider keys, tool
-      # keys, and chat platform tokens are set through the Hermes dashboard
-      # (API Keys tab), which writes them to /opt/data/.env on the disk.
+      # The Blueprint only carries vars that change how the container boots.
+      # All provider keys, tool keys, and chat platform tokens are set
+      # through the Hermes dashboard (API Keys tab), which writes them to
+      # /opt/data/.env on the disk.
 
       # Dashboard s6 service. Runs whenever HERMES_DASHBOARD is truthy;
       # s6 supervises it and restarts it on crash.
@@ -87,8 +86,7 @@ services:
       # the Environment tab and never overwritten by a Blueprint sync.
       #
       # The dashboard is an admin surface: it holds your provider keys and,
-      # with HERMES_DASHBOARD_TUI=1, a PTY into the container. Anyone who
-      # reaches it can drive the agent with your RENDER_MCP_API_KEY.
+      # with HERMES_DASHBOARD_TUI=1, a PTY into the container.
       - key: HERMES_DASHBOARD_BASIC_AUTH_USERNAME
         sync: false
       - key: HERMES_DASHBOARD_BASIC_AUTH_PASSWORD
@@ -107,16 +105,3 @@ services:
       # server (API_SERVER_ENABLED=true).
       - key: HERMES_GATEWAY_TOKEN
         generateValue: true
-
-      # Bearer token for the pre-registered Render MCP server. Generate
-      # at https://dashboard.render.com/u/*/settings#api-keys and paste
-      # into the dashboard's Environment tab. The boot-time patcher
-      # reads ${RENDER_MCP_API_KEY} into config.yaml lazily, so you can
-      # rotate by editing the env var and restarting — no rebuild needed.
-      #
-      # Named `RENDER_MCP_API_KEY` rather than the stock `RENDER_API_KEY`
-      # to avoid accidental auto-auth if someone later installs the
-      # `render` CLI. This is the same kind of Render API key; the Render
-      # account role behind the key determines what the agent can do.
-      - key: RENDER_MCP_API_KEY
-        sync: false
