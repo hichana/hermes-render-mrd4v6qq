@@ -50,10 +50,20 @@ RUN chown -R hermes:hermes /opt/hermes/ui-tui /opt/hermes/node_modules
 # image, and a boot-time idempotent patcher (Pattern 1, via a cont-init
 # hook — Pattern 2) registers it under skills.external_dirs on first boot,
 # without ever overwriting an operator's own config.yaml edits.
+#
+# The same cont-init hook also runs scripts/seed-env-from-render.py, which
+# copies a small allowlist of per-instance Render env vars (currently just
+# LINE_BASIC_ID, the skill's one dependency) into $HERMES_HOME/.env on
+# first boot — Pattern 1 applied to .env instead of config.yaml. This is
+# what lets a new client instance just get LINE_BASIC_ID set once in
+# Render's Environment tab at provisioning time, instead of requiring a
+# manual dashboard visit per instance (see README.md's "Post-deploy
+# setup" for why the dashboard is otherwise the source of truth for .env).
 COPY skills /opt/render-tools/skills-local
 COPY scripts/patch-config.py /opt/render-tools/patch-config.py
+COPY scripts/seed-env-from-render.py /opt/render-tools/seed-env-from-render.py
 COPY scripts/bootstrap.sh /etc/cont-init.d/03-render-tools
-RUN chmod 0755 /opt/render-tools/patch-config.py /etc/cont-init.d/03-render-tools
+RUN chmod 0755 /opt/render-tools/patch-config.py /opt/render-tools/seed-env-from-render.py /etc/cont-init.d/03-render-tools
 
 # Path-based multiplexer for Render's single exposed port. Render routes
 # only port 10000, but the LINE adapter's webhook server must be publicly

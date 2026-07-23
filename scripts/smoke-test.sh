@@ -49,6 +49,7 @@ docker run -d --name "${CONTAINER}" --platform "${PLATFORM}" \
   -e HERMES_DASHBOARD_PORT=10001 \
   -e HERMES_DASHBOARD_BASIC_AUTH_USERNAME=smoke \
   -e HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=smoke-test-password \
+  -e LINE_BASIC_ID=@smoketest \
   "${IMAGE}" >/dev/null
 
 echo "==> Waiting for gateway (up to ${BOOT_TIMEOUT}s)"
@@ -108,5 +109,13 @@ case "${code}" in
   30*)     fail "/line/webhook/health returned ${code} — it is hitting the DASHBOARD, not the LINE backend" ;;
   *)       fail "/line/webhook/health returned unexpected ${code}" ;;
 esac
+
+# 6. The .env seeder ran and actually wrote the artifact — not just a log
+#    line (Pattern 4: assert real state). LINE_BASIC_ID was passed as a
+#    container env var above; the cont-init hook should have copied it
+#    into /opt/data/.env on this first boot.
+docker exec "${CONTAINER}" grep -q '^LINE_BASIC_ID=@smoketest$' /opt/data/.env \
+  || fail ".env seeder did not write LINE_BASIC_ID into /opt/data/.env"
+echo "  ok: LINE_BASIC_ID seeded into /opt/data/.env from Render env"
 
 echo "PASS: image boots, gateway running, Caddy routing, auth armed"

@@ -49,11 +49,25 @@ boot, without ever overwriting an operator's manual edits to that file.
   run in lexical order). Upstream Hermes ships hooks numbered `01`, `015`,
   `02`; pick a number that lands after whatever your hook depends on
   (we used `03`, after the volume was chowned and seeded).
-- `#!/bin/sh` + `set -eu`, run as root (cont-init always does), and
-  privilege-drop into `hermes` for anything that touches `/opt/data` via
-  `s6-setuidgid` — **not** `gosu`, which isn't present in this s6-based
-  image (a real incident: see `README.md`'s "Service won't start" table
-  history for the v2026.5.7 → v2026.7.7.2 upgrade).
+- Shebang is `#!/command/with-contenv sh`, **not** plain `#!/bin/sh`, if
+  the hook (or anything it execs, e.g. via `s6-setuidgid`) needs to read
+  a Render/docker `-e` env var. s6-overlay v3 cont-init scripts don't get
+  the container environment for free — it's captured into
+  `/run/s6/container_environment/` files at container start, but only
+  `with-contenv` actually exports those into a script's process env. A
+  real incident: `scripts/seed-env-from-render.py` (Pattern 1 applied to
+  `.env`) silently saw an empty value for the var it was supposed to
+  seed, because `bootstrap.sh` used plain `#!/bin/sh` — `docker exec -u
+  hermes <script>` found the var fine (exec goes through a different
+  path), which is what made it look like a script bug at first rather
+  than a shebang/environment-propagation one. Plain `#!/bin/sh` is still
+  correct for hooks that only touch `config.yaml`/static paths and never
+  read a caller-supplied env var.
+- `set -eu`, run as root (cont-init always does), and privilege-drop into
+  `hermes` for anything that touches `/opt/data` via `s6-setuidgid` —
+  **not** `gosu`, which isn't present in this s6-based image (a real
+  incident: see `README.md`'s "Service won't start" table history for the
+  v2026.5.7 → v2026.7.7.2 upgrade).
 - Never `exec`s anything — a hook that execs pre-empts s6 from starting
   the rest of the supervised services.
 - Failures inside the hook are logged and swallowed, not fatal — same

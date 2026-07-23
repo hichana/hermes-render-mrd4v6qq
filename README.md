@@ -69,7 +69,13 @@ Walk through these tabs in order:
 3. **Status**. Confirm the gateway is running and the model is reachable. The "Connected platforms" list will be empty until we add a chat platform.
 4. **API Keys** 
 
-If we'd rather set keys from the Render Dashboard's **Environment** tab (handy for CI or secrets-manager workflows), that path also works: Render env vars override `/opt/data/.env` at process start. We should probably pick one path and stick with it to avoid drift.
+If we'd rather set keys from the Render Dashboard's **Environment** tab (handy for CI or secrets-manager workflows), that mostly also works — but confirmed in practice (2026-07-23) that it's not equivalent for everything: Hermes' own skill-readiness checks (e.g. the `line-invite` skill's `LINE_BASIC_ID` requirement, see below) read `/opt/data/.env` first and don't reliably fall back to a Render-Environment-tab-only value. For anything a skill or plugin declares as a required/optional env var, set it from the dashboard, not the Environment tab.
+
+### LINE Basic ID (per instance)
+
+If this instance uses the `line-invite` skill (manager-initiated QR join invites), it needs `LINE_BASIC_ID` — the channel's public LINE Basic ID (LINE Developers Console → Messaging API → Basic Settings, e.g. `@abc1234`) — set in the dashboard's **API Keys** tab. It's not a secret, just per-instance config, but it has to land in `/opt/data/.env` the same way provider keys do; see the note above for why the Environment tab alone isn't enough.
+
+To automate this per new client instance instead of visiting the dashboard by hand: set `LINE_BASIC_ID` as a plain Render **Environment**-tab var when you provision the service. A boot-time hook (`scripts/seed-env-from-render.py`, installed via the Dockerfile) copies it into `/opt/data/.env` automatically on first boot — idempotent, and it never overwrites a value you later change from the dashboard. See the Dockerfile's `line-invite skill` comment block for how this is wired up.
 
 ### Where the "gateway token" fits
 
