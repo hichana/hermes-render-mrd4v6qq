@@ -4,6 +4,10 @@ description: "Use when an already-authorized user asks to invite/onboard someone
 version: 1.0.0
 author: Hermes Render
 license: MIT
+required_environment_variables:
+  - name: LINE_BASIC_ID
+    prompt: "Your LINE channel's public Basic ID (e.g. @abc1234)"
+    help: "LINE Developers Console → Messaging API channel → Basic Settings → Basic ID"
 metadata:
   hermes:
     tags: [line, onboarding, pairing, qr, invite]
