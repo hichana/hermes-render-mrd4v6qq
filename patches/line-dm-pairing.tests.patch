@@ -1,0 +1,355 @@
+diff --git a/tests/gateway/test_line_plugin.py b/tests/gateway/test_line_plugin.py
+index 9d897ce..2a73a2c 100644
+--- a/tests/gateway/test_line_plugin.py
++++ b/tests/gateway/test_line_plugin.py
+@@ -45,6 +45,7 @@ validate_config = _line.validate_config
+ _standalone_send = _line._standalone_send
+ _env_enablement = _line._env_enablement
+ _MessageDeduplicator = _line._MessageDeduplicator
++LineInviteStore = _line.LineInviteStore
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -674,3 +675,342 @@ class TestMessageTypeMapping:
+     def test_unknown_type_falls_back_to_text(self):
+         MessageType = _line.MessageType
+         assert _line._LINE_MESSAGE_TYPES.get("flex", MessageType.TEXT) == MessageType.TEXT
++
++
++# ---------------------------------------------------------------------------
++# 10. DM pairing (dm_policy)
++# ---------------------------------------------------------------------------
++
++class TestDmPolicy:
++    """LINE previously ran its own three-list allowlist check in
++    _dispatch_event and dropped unauthorized DMs before they ever reached
++    the gateway's central pairing logic. dm_policy (mirroring
++    WeCom/Weixin/QQBot/WhatsApp) fixes that: unrecognized DMs now fall
++    through to the gateway when pairing-eligible, while groups/rooms keep
++    the original strict allowlist-only behavior."""
++
++    def _make_adapter(self, monkeypatch, **extra):
++        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
++        monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
++        from gateway.config import PlatformConfig
++        return LineAdapter(PlatformConfig(enabled=True, extra=extra))
++
++    def test_dm_policy_defaults_to_pairing(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch)
++        assert adapter._dm_policy == "pairing"
++
++    def test_dm_policy_explicit_extra(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch, dm_policy="allowlist")
++        assert adapter._dm_policy == "allowlist"
++
++    def test_dm_policy_from_env(self, monkeypatch):
++        monkeypatch.setenv("LINE_DM_POLICY", "disabled")
++        adapter = self._make_adapter(monkeypatch)
++        assert adapter._dm_policy == "disabled"
++
++    def test_extra_takes_precedence_over_env(self, monkeypatch):
++        monkeypatch.setenv("LINE_DM_POLICY", "disabled")
++        adapter = self._make_adapter(monkeypatch, dm_policy="open")
++        assert adapter._dm_policy == "open"
++
++    def test_enforces_own_access_policy_is_true(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch)
++        assert adapter.enforces_own_access_policy is True
++
++    def test_intake_disabled_blocks_everyone(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch, dm_policy="disabled")
++        assert adapter._is_dm_intake_allowed("Uany") is False
++
++    def test_intake_allowlist_matches_allowed_users_only(self, monkeypatch):
++        monkeypatch.setenv("LINE_ALLOWED_USERS", "Uok")
++        adapter = self._make_adapter(monkeypatch, dm_policy="allowlist")
++        assert adapter._is_dm_intake_allowed("Uok") is True
++        assert adapter._is_dm_intake_allowed("Uother") is False
++
++    def test_intake_pairing_lets_anyone_through_to_gateway(self, monkeypatch):
++        # This is the whole point: pairing does NOT mean "authorized" — it
++        # means "eligible to reach the gateway's own pairing-code flow".
++        adapter = self._make_adapter(monkeypatch, dm_policy="pairing")
++        assert adapter._is_dm_intake_allowed("Uany") is True
++
++    def test_intake_open_follows_allow_all(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch, dm_policy="open")
++        assert adapter._is_dm_intake_allowed("Uany") is False
++        monkeypatch.setenv("LINE_ALLOW_ALL_USERS", "true")
++        adapter = self._make_adapter(monkeypatch, dm_policy="open")
++        assert adapter._is_dm_intake_allowed("Uany") is True
++
++
++class TestDispatchEventDmPairing:
++    """Exercises the actual _dispatch_event gate rewrite, not just the
++    _is_dm_intake_allowed helper in isolation."""
++
++    def _make_adapter(self, monkeypatch, **extra):
++        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
++        monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
++        from gateway.config import PlatformConfig
++        adapter = LineAdapter(PlatformConfig(enabled=True, extra=extra))
++        adapter._handle_message_event = AsyncMock()
++        adapter._handle_postback_event = AsyncMock()
++        return adapter
++
++    def test_unrecognized_dm_default_policy_reaches_handler(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch)
++        event = {
++            "type": "message",
++            "source": {"type": "user", "userId": "Ustranger"},
++            "message": {"type": "text", "text": "hi"},
++        }
++        asyncio.run(adapter._dispatch_event(event))
++        adapter._handle_message_event.assert_awaited_once()
++
++    def test_unrecognized_dm_disabled_policy_still_dropped(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch, dm_policy="disabled")
++        event = {
++            "type": "message",
++            "source": {"type": "user", "userId": "Ustranger"},
++            "message": {"type": "text", "text": "hi"},
++        }
++        asyncio.run(adapter._dispatch_event(event))
++        adapter._handle_message_event.assert_not_awaited()
++
++    def test_unrecognized_dm_allowlist_policy_still_dropped(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch, dm_policy="allowlist")
++        event = {
++            "type": "message",
++            "source": {"type": "user", "userId": "Ustranger"},
++            "message": {"type": "text", "text": "hi"},
++        }
++        asyncio.run(adapter._dispatch_event(event))
++        adapter._handle_message_event.assert_not_awaited()
++
++    def test_unrecognized_group_message_still_dropped_regardless_of_dm_policy(self, monkeypatch):
++        # Pairing is DM-only — a pairing-friendly dm_policy must not leak
++        # into group/room gating.
++        adapter = self._make_adapter(monkeypatch, dm_policy="pairing")
++        event = {
++            "type": "message",
++            "source": {"type": "group", "groupId": "Cstranger", "userId": "Uany"},
++            "message": {"type": "text", "text": "hi"},
++        }
++        asyncio.run(adapter._dispatch_event(event))
++        adapter._handle_message_event.assert_not_awaited()
++
++    def test_unrecognized_room_message_still_dropped_regardless_of_dm_policy(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch, dm_policy="pairing")
++        event = {
++            "type": "message",
++            "source": {"type": "room", "roomId": "Rstranger", "userId": "Uany"},
++            "message": {"type": "text", "text": "hi"},
++        }
++        asyncio.run(adapter._dispatch_event(event))
++        adapter._handle_message_event.assert_not_awaited()
++
++    def test_already_allowlisted_user_still_reaches_handler(self, monkeypatch):
++        # Regression check on the pre-existing three-list behavior: an
++        # explicitly allowlisted user must keep working unchanged, even
++        # under a strict dm_policy.
++        monkeypatch.setenv("LINE_ALLOWED_USERS", "Uok")
++        adapter = self._make_adapter(monkeypatch, dm_policy="disabled")
++        event = {
++            "type": "message",
++            "source": {"type": "user", "userId": "Uok"},
++            "message": {"type": "text", "text": "hi"},
++        }
++        asyncio.run(adapter._dispatch_event(event))
++        adapter._handle_message_event.assert_awaited_once()
++
++    def test_already_allowlisted_group_still_reaches_handler(self, monkeypatch):
++        monkeypatch.setenv("LINE_ALLOWED_GROUPS", "Cok")
++        adapter = self._make_adapter(monkeypatch)
++        event = {
++            "type": "message",
++            "source": {"type": "group", "groupId": "Cok", "userId": "Uany"},
++            "message": {"type": "text", "text": "hi"},
++        }
++        asyncio.run(adapter._dispatch_event(event))
++        adapter._handle_message_event.assert_awaited_once()
++
++
++# ---------------------------------------------------------------------------
++# 11. One-off join invites (Phase 6c: manager-initiated QR invite)
++# ---------------------------------------------------------------------------
++
++class TestLineInviteStore:
++    """Invite store: mint/expire/single-use-redeem/already-redeemed/
++    not-found, plus the per-uid guessing-protection lockout — mirroring the
++    style of gateway.pairing's PairingStore tests, since a matched invite
++    grants access immediately with no approval step and needs the same
++    guessing protection pairing codes get."""
++
++    def test_mint_returns_token_of_configured_length(self, monkeypatch, tmp_path):
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        store = LineInviteStore()
++        token = store.mint("Jamie — PT cashier", "Umanager")
++        assert len(token) == _line.LINE_INVITE_TOKEN_LENGTH
++        assert set(token) <= set(_line.LINE_INVITE_ALPHABET)
++
++    def test_redeem_valid_token_returns_entry_and_marks_redeemed(self, monkeypatch, tmp_path):
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        store = LineInviteStore()
++        token = store.mint("Jamie", "Umanager")
++
++        entry = store.try_redeem("Ucandidate", token)
++        assert entry is not None
++        assert entry["label"] == "Jamie"
++        assert entry["created_by"] == "Umanager"
++
++        # Single-use: the same token must not redeem twice, even from a
++        # different uid.
++        assert store.try_redeem("Uother", token) is None
++
++    def test_redeem_unknown_token_fails_safe(self, monkeypatch, tmp_path):
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        store = LineInviteStore()
++        store.mint("Jamie", "Umanager")
++        bogus = "A" * _line.LINE_INVITE_TOKEN_LENGTH
++        assert store.try_redeem("Ucandidate", bogus) is None
++
++    def test_redeem_expired_token_fails(self, monkeypatch, tmp_path):
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        store = LineInviteStore()
++        token = store.mint("Jamie", "Umanager", ttl_hours=-1)  # already expired
++        assert store.try_redeem("Ucandidate", token) is None
++
++    def test_ordinary_chat_text_is_not_treated_as_a_token_attempt(self, monkeypatch, tmp_path):
++        # Regression guard: text that isn't token-shaped (wrong length/
++        # alphabet) must short-circuit before touching the store at all, so
++        # normal DM chatter from strangers (Phase 1/6's manual-onboarding
++        # path) never trips the per-uid lockout below.
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        store = LineInviteStore()
++        assert store.try_redeem("Ustranger", "hi there!") is None
++        assert store._is_locked_out("Ustranger") is False
++
++    def test_repeated_failed_token_shaped_attempts_lock_out_that_uid_only(self, monkeypatch, tmp_path):
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        store = LineInviteStore()
++        bogus = "B" * _line.LINE_INVITE_TOKEN_LENGTH
++        for _ in range(_line.LINE_INVITE_MAX_FAILED_ATTEMPTS):
++            assert store.try_redeem("Uguesser", bogus) is None
++        assert store._is_locked_out("Uguesser") is True
++
++        # A different uid, and a real live invite, are unaffected.
++        token = store.mint("Jamie", "Umanager")
++        assert store._is_locked_out("Ucandidate") is False
++        assert store.try_redeem("Ucandidate", token) is not None
++
++
++class TestDispatchEventInviteRedemption:
++    """Exercises the _dispatch_event integration, not just LineInviteStore
++    in isolation: a matched invite must grant access via
++    PairingStore._approve_user and short-circuit before the generic
++    pairing-code reply; a non-match must fall through unchanged."""
++
++    def _make_adapter(self, monkeypatch, **extra):
++        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
++        monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
++        from gateway.config import PlatformConfig
++        adapter = LineAdapter(PlatformConfig(enabled=True, extra=extra))
++        adapter._handle_message_event = AsyncMock()
++        adapter.send = AsyncMock(return_value=_line.SendResult(success=True))
++        return adapter
++
++    def test_valid_invite_grants_access_and_does_not_reach_pairing_handler(self, monkeypatch, tmp_path):
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        adapter = self._make_adapter(monkeypatch)
++        token = adapter._invites.mint("Jamie", "Umanager")
++
++        event = {
++            "type": "message",
++            "source": {"type": "user", "userId": "Ucandidate"},
++            "message": {"type": "text", "text": token},
++            "replyToken": "rt-1",
++        }
++        asyncio.run(adapter._dispatch_event(event))
++
++        # Did NOT fall through to the generic pairing-code path.
++        adapter._handle_message_event.assert_not_awaited()
++        # Welcome message sent to the candidate.
++        adapter.send.assert_any_await("Ucandidate", adapter.invite_welcome_text)
++
++        from gateway.pairing import PairingStore
++        assert PairingStore().is_approved("line", "Ucandidate") is True
++
++    def test_valid_invite_notifies_the_creator(self, monkeypatch, tmp_path):
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        adapter = self._make_adapter(monkeypatch)
++        token = adapter._invites.mint("Jamie", "Umanager")
++
++        event = {
++            "type": "message",
++            "source": {"type": "user", "userId": "Ucandidate"},
++            "message": {"type": "text", "text": token},
++            "replyToken": "rt-1",
++        }
++        asyncio.run(adapter._dispatch_event(event))
++
++        notify_calls = [c for c in adapter.send.await_args_list if c.args[0] == "Umanager"]
++        assert len(notify_calls) == 1
++        assert "Jamie" in notify_calls[0].args[1]
++
++    def test_invalid_token_falls_through_to_pairing_handler_unchanged(self, monkeypatch, tmp_path):
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        adapter = self._make_adapter(monkeypatch)
++        event = {
++            "type": "message",
++            "source": {"type": "user", "userId": "Ustranger"},
++            "message": {"type": "text", "text": "just saying hi"},
++            "replyToken": "rt-1",
++        }
++        asyncio.run(adapter._dispatch_event(event))
++
++        # Falls through unchanged: default dm_policy is "pairing", so this
++        # still reaches the generic handler exactly as it did pre-6c.
++        adapter._handle_message_event.assert_awaited_once()
++
++    def test_token_cannot_be_redeemed_twice_by_a_third_party(self, monkeypatch, tmp_path):
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        adapter = self._make_adapter(monkeypatch)
++        token = adapter._invites.mint("Jamie", "Umanager")
++
++        first = {
++            "type": "message",
++            "source": {"type": "user", "userId": "Ucandidate"},
++            "message": {"type": "text", "text": token},
++            "replyToken": "rt-1",
++        }
++        asyncio.run(adapter._dispatch_event(first))
++        adapter._handle_message_event.reset_mock()
++
++        second = {
++            "type": "message",
++            "source": {"type": "user", "userId": "Uinterloper"},
++            "message": {"type": "text", "text": token},
++            "replyToken": "rt-2",
++        }
++        asyncio.run(adapter._dispatch_event(second))
++
++        # The reused token must fall through to the generic pairing path,
++        # not grant a second, unrelated user access.
++        adapter._handle_message_event.assert_awaited_once()
++        from gateway.pairing import PairingStore
++        assert PairingStore().is_approved("line", "Uinterloper") is False
++
++    def test_disabled_dm_policy_still_allows_invite_redemption(self, monkeypatch, tmp_path):
++        # The invite grant is independent of dm_policy — a manager-vetted
++        # candidate must get in even on a locked-down channel.
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        adapter = self._make_adapter(monkeypatch, dm_policy="disabled")
++        token = adapter._invites.mint("Jamie", "Umanager")
++
++        event = {
++            "type": "message",
++            "source": {"type": "user", "userId": "Ucandidate"},
++            "message": {"type": "text", "text": token},
++            "replyToken": "rt-1",
++        }
++        asyncio.run(adapter._dispatch_event(event))
++
++        from gateway.pairing import PairingStore
++        assert PairingStore().is_approved("line", "Ucandidate") is True

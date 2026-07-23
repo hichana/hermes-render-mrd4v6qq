@@ -1,0 +1,444 @@
+diff --git a/plugins/platforms/line/adapter.py b/plugins/platforms/line/adapter.py
+index 447cf5f..695cb93 100644
+--- a/plugins/platforms/line/adapter.py
++++ b/plugins/platforms/line/adapter.py
+@@ -72,6 +72,7 @@ import os
+ import re
+ import secrets
+ import tempfile
++import threading
+ import time
+ import uuid
+ from dataclasses import dataclass, field
+@@ -128,6 +129,20 @@ DEFAULT_BUTTON_LABEL = "Get answer"
+ DEFAULT_DELIVERED_TEXT = "Already replied ✅"
+ DEFAULT_INTERRUPTED_TEXT = "Run was interrupted before completion."
+ 
++# One-off join invite defaults (Phase 6c: manager-initiated QR invite)
++DEFAULT_INVITE_WELCOME_TEXT = "Welcome! You're all set — go ahead and send a message anytime~"
++
++# One-off join invites — separate alphabet/length from gateway.pairing's
++# 8-char codes. Those are protected by PairingStore's own per-user rate
++# limit + lockout; a matched invite here grants access with no approval
++# step at all, so it needs a length that makes guessing infeasible on its
++# own, plus its own lockout (below) as defense in depth.
++LINE_INVITE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
++LINE_INVITE_TOKEN_LENGTH = 16
++LINE_INVITE_TTL_HOURS_DEFAULT = 48
++LINE_INVITE_MAX_FAILED_ATTEMPTS = 5
++LINE_INVITE_LOCKOUT_SECONDS = 3600
++
+ # Media defaults
+ MEDIA_TOKEN_TTL_SECONDS = 1800  # 30 minutes; LINE caches the URL aggressively
+ LINE_IMAGE_MAX_BYTES = 10 * 1024 * 1024  # 10 MB per LINE docs
+@@ -438,6 +453,176 @@ def _allowed_for_source(
+     return False
+ 
+ 
++# ---------------------------------------------------------------------------
++# One-off join invites (Phase 6c: manager-initiated QR invite)
++# ---------------------------------------------------------------------------
++
++class LineInviteStore:
++    """One-off, single-use LINE join invites.
++
++    Deliberately separate from ``gateway.pairing.PairingStore``: a pairing
++    code binds to the identity it was generated *for* (see
++    ``PairingStore.approve_code``), but an invite is minted before the
++    candidate's real LINE user ID exists — there's nothing to bind to yet.
++    This store instead binds on *redemption*: whoever presents a live,
++    unexpired, unredeemed token first is the one who gets approved.
++
++    Mirrors ``PairingStore``'s hash-and-salt-at-rest, atomic-write
++    (temp file + rename, chmod 0600), and lockout-after-repeated-failures
++    patterns, since a matched token here grants access immediately with
++    no approval step — it needs the same guessing protection pairing
++    codes get, not less.
++
++    Imported directly by the ``line-invite`` skill's generation script
++    (``skills/line-invite/scripts/generate_invite.py`` in the
++    hermes-render repo, not this one) to keep the token format and
++    on-disk schema in one place rather than duplicated across the two
++    call sites.
++    """
++
++    def __init__(self) -> None:
++        from hermes_constants import get_hermes_dir
++        self._dir = get_hermes_dir("platforms/line-invites", "line-invites")
++        self._dir.mkdir(parents=True, exist_ok=True)
++        self._lock = threading.RLock()
++
++    def _invites_path(self) -> Path:
++        return self._dir / "invites.json"
++
++    def _state_path(self) -> Path:
++        return self._dir / "_redeem_state.json"
++
++    @staticmethod
++    def _load_json(path: Path) -> Dict[str, Any]:
++        if path.exists():
++            try:
++                data = json.loads(path.read_text(encoding="utf-8"))
++                return data if isinstance(data, dict) else {}
++            except (json.JSONDecodeError, OSError):
++                return {}
++        return {}
++
++    @staticmethod
++    def _save_json(path: Path, data: Dict[str, Any]) -> None:
++        path.parent.mkdir(parents=True, exist_ok=True)
++        fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
++        try:
++            with os.fdopen(fd, "w", encoding="utf-8") as f:
++                f.write(json.dumps(data, indent=2, ensure_ascii=False))
++                f.flush()
++                os.fsync(f.fileno())
++            os.replace(tmp_path, path)
++            try:
++                os.chmod(path, 0o600)
++            except OSError:
++                pass
++        except BaseException:
++            try:
++                os.unlink(tmp_path)
++            except OSError:
++                pass
++            raise
++
++    @staticmethod
++    def _hash_token(token: str, salt: bytes) -> str:
++        return hashlib.sha256(salt + token.encode("utf-8")).hexdigest()
++
++    def mint(
++        self,
++        label: str,
++        created_by: str,
++        ttl_hours: float = LINE_INVITE_TTL_HOURS_DEFAULT,
++    ) -> str:
++        """Create a new one-off invite. Returns the plaintext token (shown once — only the salted hash is persisted)."""
++        with self._lock:
++            invites = self._load_json(self._invites_path())
++            token = "".join(
++                secrets.choice(LINE_INVITE_ALPHABET) for _ in range(LINE_INVITE_TOKEN_LENGTH)
++            )
++            salt = os.urandom(16)
++            entry_id = secrets.token_hex(8)
++            now = time.time()
++            invites[entry_id] = {
++                "hash": self._hash_token(token, salt),
++                "salt": salt.hex(),
++                "label": label,
++                "created_by": created_by,
++                "created_at": now,
++                "expires_at": now + max(0.0, ttl_hours) * 3600,
++                "redeemed": False,
++                "redeemed_by": None,
++                "redeemed_at": None,
++            }
++            self._save_json(self._invites_path(), invites)
++            return token
++
++    def _is_locked_out(self, uid: str) -> bool:
++        state = self._load_json(self._state_path())
++        return time.time() < state.get(f"lockout:{uid}", 0)
++
++    def _record_failed_attempt(self, uid: str) -> None:
++        state = self._load_json(self._state_path())
++        fail_key = f"failures:{uid}"
++        fails = state.get(fail_key, 0) + 1
++        state[fail_key] = fails
++        if fails >= LINE_INVITE_MAX_FAILED_ATTEMPTS:
++            state[f"lockout:{uid}"] = time.time() + LINE_INVITE_LOCKOUT_SECONDS
++            state[fail_key] = 0
++            logger.warning(
++                "LINE: invite redemption locked out for %s for %ss after %d failed attempts",
++                uid, LINE_INVITE_LOCKOUT_SECONDS, LINE_INVITE_MAX_FAILED_ATTEMPTS,
++            )
++        self._save_json(self._state_path(), state)
++
++    def try_redeem(self, uid: str, candidate_text: str) -> Optional[Dict[str, Any]]:
++        """Redeem ``candidate_text`` as an invite token if it's live and unused.
++
++        Fails safe: any non-match (typo/expired/redeemed/ordinary chat text
++        that isn't a token attempt at all) returns ``None`` without raising,
++        so callers can fall through to existing behavior unchanged. Guessing
++        protection is scoped per-``uid`` (not global) so one prankster can't
++        lock legitimate candidates out of redeeming a live invite.
++
++        Only text shaped like a real token attempt (right length, right
++        alphabet) counts against the per-uid failure counter — this keeps
++        ordinary DM chatter from strangers (Phase 1/6's manual-onboarding
++        path) from tripping the lockout.
++        """
++        candidate = (candidate_text or "").strip().upper()
++        if len(candidate) != LINE_INVITE_TOKEN_LENGTH or not set(candidate) <= set(LINE_INVITE_ALPHABET):
++            return None
++        with self._lock:
++            if self._is_locked_out(uid):
++                return None
++            invites = self._load_json(self._invites_path())
++            now = time.time()
++            matched_id = None
++            matched_entry = None
++            for entry_id, entry in invites.items():
++                if not isinstance(entry, dict) or entry.get("redeemed"):
++                    continue
++                if now >= entry.get("expires_at", 0):
++                    continue
++                try:
++                    salt = bytes.fromhex(entry["salt"])
++                except (ValueError, KeyError, TypeError):
++                    continue
++                if secrets.compare_digest(self._hash_token(candidate, salt), entry.get("hash", "")):
++                    matched_id = entry_id
++                    matched_entry = entry
++                    break
++
++            if matched_id is None:
++                self._record_failed_attempt(uid)
++                return None
++
++            invites[matched_id]["redeemed"] = True
++            invites[matched_id]["redeemed_by"] = uid
++            invites[matched_id]["redeemed_at"] = now
++            self._save_json(self._invites_path(), invites)
++            return dict(matched_entry)
++
++
+ # ---------------------------------------------------------------------------
+ # LINE Reply / Push HTTP client
+ # ---------------------------------------------------------------------------
+@@ -527,6 +712,21 @@ class _LineClient:
+         except Exception:
+             return None
+ 
++    async def get_profile(self, user_id: str) -> Optional[Dict[str, Any]]:
++        """Fetch a LINE user's public profile. Best-effort — returns None on any failure."""
++        import aiohttp
++        url = f"https://api.line.me/v2/bot/profile/{user_id}"
++        timeout = aiohttp.ClientTimeout(total=10.0)
++        try:
++            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
++                async with session.get(url, headers=self._headers) as resp:
++                    if resp.status >= 400:
++                        return None
++                    return await resp.json()
++        except Exception as exc:
++            logger.debug("LINE: get_profile(%s) failed: %s", user_id, exc)
++            return None
++
+ 
+ # ---------------------------------------------------------------------------
+ # Message builders
+@@ -636,7 +836,17 @@ def _truthy_env(name: str, default: bool = False) -> bool:
+ # ---------------------------------------------------------------------------
+ 
+ class LineAdapter(BasePlatformAdapter):
+-    """LINE Messaging API gateway adapter."""
++    """LINE Messaging API gateway adapter.
++
++    Supports DM pairing: an unrecognized DM under ``dm_policy: pairing``
++    (the default) is forwarded to the gateway's central authorization
++    logic instead of being dropped, so the user gets a pairing code and
++    an operator can grant access via ``hermes pairing approve line``.
++
++    Also supports one-off QR join invites (``LineInviteStore``, above): an
++    unrecognized DM whose text matches a live invite token is approved
++    immediately, no operator step required — see the ``line-invite`` skill.
++    """
+ 
+     # LINE has its own message-edit story (none) — we always send fresh
+     # bubbles, never edit, so REQUIRES_EDIT_FINALIZE stays False.
+@@ -689,6 +899,15 @@ class LineAdapter(BasePlatformAdapter):
+             os.getenv("LINE_ALLOWED_ROOMS", "")
+         ) | set(extra.get("allowed_rooms", []))
+ 
++        # DM pairing policy — mirrors QQBot/Weixin/WhatsApp's dm_policy
++        # switch. "pairing" (default) lets an unrecognized DM fall through
++        # to the gateway's central pairing/authorization logic instead of
++        # being dropped here; LINE_ALLOWED_USERS keeps working unchanged
++        # as a separate, unioned grant.
++        self._dm_policy = str(
++            extra.get("dm_policy") or os.getenv("LINE_DM_POLICY", "pairing")
++        ).strip().lower()
++
+         # Slow-LLM postback button threshold
+         try:
+             self.slow_response_threshold = float(
+@@ -715,6 +934,13 @@ class LineAdapter(BasePlatformAdapter):
+             os.getenv("LINE_INTERRUPTED_TEXT")
+             or extra.get("interrupted_text", DEFAULT_INTERRUPTED_TEXT)
+         )
++        self.invite_welcome_text = (
++            os.getenv("LINE_INVITE_WELCOME_TEXT")
++            or extra.get("invite_welcome_text", DEFAULT_INVITE_WELCOME_TEXT)
++        )
++
++        # One-off join invites (Phase 6c) — manager-initiated QR invite flow.
++        self._invites = LineInviteStore()
+ 
+         # Runtime state
+         self._client: Optional[_LineClient] = None
+@@ -736,6 +962,23 @@ class LineAdapter(BasePlatformAdapter):
+         # button per chat at a time. Postback cache request_id keyed by chat_id.
+         self._pending_buttons: Dict[str, str] = {}
+ 
++    @property
++    def enforces_own_access_policy(self) -> bool:
++        """LINE gates group/room access itself; DM access follows dm_policy."""
++        return True
++
++    def _is_dm_intake_allowed(self, user_id: str) -> bool:
++        """Whether an unrecognized DM may reach the gateway (pairing handshake path)."""
++        if self._dm_policy == "disabled":
++            return False
++        if self._dm_policy == "allowlist":
++            return bool(user_id) and user_id in self.allowed_users
++        if self._dm_policy == "pairing":
++            return True
++        if self._dm_policy == "open":
++            return self.allow_all
++        return False
++
+     # ------------------------------------------------------------------
+     # Connection lifecycle
+     # ------------------------------------------------------------------
+@@ -909,16 +1152,37 @@ class LineAdapter(BasePlatformAdapter):
+         if self._bot_user_id and sender_user_id == self._bot_user_id:
+             return
+ 
+-        # Allowlist gate.
+-        if not _allowed_for_source(
+-            source,
+-            allow_all=self.allow_all,
+-            user_ids=self.allowed_users,
+-            group_ids=self.allowed_groups,
+-            room_ids=self.allowed_rooms,
+-        ):
+-            logger.info("LINE: rejecting unauthorized source %s", source)
+-            return
++        # Allowlist gate. DMs (source type "user") that aren't already
++        # allowlisted still fall through to the gateway when eligible for
++        # pairing (or fully open) under _dm_policy — that's what lets the
++        # central pairing logic in gateway/run.py ever see them and send a
++        # pairing code. Groups/rooms keep the strict allowlist-only gate;
++        # pairing is a DM-only concept everywhere in Hermes.
++        src_type = (source or {}).get("type", "")
++        if src_type == "user":
++            uid = source.get("userId", "")
++            allowed = self.allow_all or (uid in self.allowed_users)
++            # Manager-initiated one-off QR invite (Phase 6c): an unrecognized
++            # DM whose text matches a live invite token is granted access
++            # immediately, bypassing the pairing-code handshake entirely —
++            # the interview *was* the approval. Checked before
++            # _is_dm_intake_allowed so it also works under dm_policy:
++            # disabled/allowlist, not just the pairing default.
++            if not allowed and await self._try_handle_invite_redemption(event, uid):
++                return
++            if not allowed and not self._is_dm_intake_allowed(uid):
++                logger.info("LINE: rejecting unauthorized source %s", source)
++                return
++        else:
++            if not _allowed_for_source(
++                source,
++                allow_all=self.allow_all,
++                user_ids=self.allowed_users,
++                group_ids=self.allowed_groups,
++                room_ids=self.allowed_rooms,
++            ):
++                logger.info("LINE: rejecting unauthorized source %s", source)
++                return
+ 
+         if event_type == "message":
+             await self._handle_message_event(event)
+@@ -929,6 +1193,67 @@ class LineAdapter(BasePlatformAdapter):
+         else:
+             logger.debug("LINE: ignoring event type %r", event_type)
+ 
++    async def _try_handle_invite_redemption(self, event: Dict[str, Any], uid: str) -> bool:
++        """Check an unrecognized DM's text against the invite store.
++
++        On a match: grant access immediately (``PairingStore._approve_user``,
++        under its lock, same as ``approve_code`` does internally — this is
++        deliberately *not* ``PairingStore.generate_code``/``approve_code``,
++        since those bind to an identity known at code-generation time, which
++        doesn't exist yet for an unmet candidate), mark the invite redeemed,
++        send a welcome reply, and best-effort notify whoever created the
++        invite. Returns ``True`` if the event was fully handled — the caller
++        must not fall through to the generic pairing-code reply in that case.
++
++        Fails safe: any non-match returns ``False`` immediately with no side
++        effects beyond the invite store's own per-uid guessing counter, so
++        today's dm_policy behavior is unchanged for anyone not presenting a
++        real invite token.
++        """
++        if event.get("type") != "message":
++            return False
++        msg = event.get("message") or {}
++        if msg.get("type") != "text":
++            return False
++
++        entry = self._invites.try_redeem(uid, msg.get("text", "") or "")
++        if entry is None:
++            return False
++
++        source = event.get("source") or {}
++        chat_id, _ = _resolve_chat(source)
++        reply_token = event.get("replyToken", "")
++        if chat_id and reply_token:
++            self._reply_tokens[chat_id] = (
++                reply_token,
++                time.time() + LINE_REPLY_TOKEN_TTL_SECONDS,
++            )
++
++        display_name = uid
++        if self._client:
++            profile = await self._client.get_profile(uid)
++            if profile and profile.get("displayName"):
++                display_name = profile["displayName"]
++
++        from gateway.pairing import PairingStore
++        store = PairingStore()
++        with store._lock:
++            store._approve_user("line", uid, display_name)
++
++        if chat_id:
++            await self.send(chat_id, self.invite_welcome_text)
++
++        label = entry.get("label", "") or display_name
++        created_by = entry.get("created_by", "")
++        if created_by:
++            try:
++                await self.send(created_by, f"✅ {label} just joined via your invite!")
++            except Exception as exc:
++                logger.debug("LINE: invite-redeemed notify to %s failed: %s", created_by, exc)
++
++        logger.info("LINE: invite redeemed by %s (label=%r)", uid, entry.get("label", ""))
++        return True
++
+     async def _handle_message_event(self, event: Dict[str, Any]) -> None:
+         msg = event.get("message") or {}
+         msg_type = msg.get("type", "")
+diff --git a/plugins/platforms/line/plugin.yaml b/plugins/platforms/line/plugin.yaml
+index f854bc4..27f1bd2 100644
+--- a/plugins/platforms/line/plugin.yaml
++++ b/plugins/platforms/line/plugin.yaml
+@@ -55,6 +55,10 @@ optional_env:
+     description: "Allow any LINE user to talk to the bot (dev only — disables allowlist)"
+     prompt: "Allow all users? (true/false)"
+     password: false
++  - name: LINE_DM_POLICY
++    description: "DM access policy: open | allowlist | disabled | pairing (default: pairing). Under 'pairing', an unrecognized DM gets a pairing code instead of being silently dropped; LINE_ALLOWED_USERS keeps working as an additional, unioned grant."
++    prompt: "DM policy (open/allowlist/disabled/pairing)"
++    password: false
+   - name: LINE_HOME_CHANNEL
+     description: "Default user/group/room ID for cron / notification delivery"
+     prompt: "Home channel ID (or empty)"
+@@ -63,3 +67,7 @@ optional_env:
+     description: "Seconds before the slow-LLM postback button fires (default: 45; set 0 to disable and always Push-fallback)"
+     prompt: "Slow response threshold (seconds)"
+     password: false
++  - name: LINE_BASIC_ID
++    description: "This channel's public LINE Basic ID (LINE Developers Console > Messaging API > Basic ID, e.g. @abc1234). Used by the line-invite skill to build the manager-initiated QR join-invite deep link — not read by the adapter itself."
++    prompt: "LINE Basic ID (e.g. @abc1234)"
++    password: false

@@ -1,12 +1,12 @@
 # Hermes Agent on Render
 
-[Hermes Agent](https://github.com/NousResearch/hermes-agent) (the self-improving AI agent from Nous Research) on Render as a single Docker web service. This is our agent harnes for building out agent platforms for clients.
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) (the self-improving AI agent from Nous Research) on Render as a single Docker web service. We customize Hermes Agent as our harness for building out agent platforms for clients.
 
-The initial instance was bootstrapped from [HERE](https://render.com/deploy-template/api/github/start?template_repo=hermes-render).
+The initial instance was bootstrapped from [HERE](https://render.com/deploy-template/api/github/start?template_repo=hermes-render) but we've implemented a number of customizations to suit our use case. Our intention is to make our harness into a versioned template that we can use to deploy agent platforms for multiple clients.
+
+In the repo, the `render.yaml` is the Blueprint describing our Render service. The Dockerfile defines a container image that Render builds and runs. Render provides and manages the VM/compute underneath, but we never interact with a VM directly. We only ever produce the image; Render's platform handles scheduling, restarts, and the runtime environment around the container.
 
 The Hermes release is pinned in the `Dockerfile` for reproducible deploys. All Hermes state lives on a persistent disk so upgrades stay non-destructive, and the dashboard at the service URL is the primary setup surface.
-
-This template deliberately carries no Render account access: no Render MCP server, no Render API key, no `render` CLI. Each deployed instance is a client-facing agent, and only admins provision or manage Render resources — done directly via the Render dashboard or CLI, never through a deployed agent.
 
 > **Use at your own risk:** Hermes' dashboard holds your LLM provider keys and, with `HERMES_DASHBOARD_TUI=1`, a PTY into the container. Lock down dashboard access.
 
@@ -42,71 +42,34 @@ A single container runs both Hermes processes under [s6-overlay](https://github.
 
 > **Do not override the image's `ENTRYPOINT`.** Boot-time work belongs in an `/etc/cont-init.d/` hook. Overriding `ENTRYPOINT` is what broke the v2026.5.7 → v2026.7.7.2 upgrade: `/usr/bin/tini` is now a symlink to `/init`, so an old `tini -g -- ...` ENTRYPOINT resolved to `/init -g -- …`, s6 tried to run `-g` as the main program, and the boot failed — while the container stayed up and the health check kept passing. Run [`scripts/smoke-test.sh`](scripts/smoke-test.sh) after any `HERMES_IMAGE` bump.
 
-Hermes also supports **one gateway process per profile**: each profile gets its own `/run/service/gateway-<name>` service, reconciled on every boot from that profile's `gateway_state.json` on the disk. Each runs with its own `HERMES_HOME` and its own `.env`, so per-profile settings (including port-binding platforms like LINE) stay independent.
+Hermes also supports **one gateway process per profile**: each profile gets its own `/run/service/gateway-<name>` service, reconciled on every boot from that profile's `gateway_state.json` on the disk. Each runs with its own `HERMES_HOME` and its own `.env`, so per-profile settings (including port-binding platforms like LINE) stay independent. For our purposes, we will only run one agent/gateway per business.
 
 The disk holds everything that should survive a redeploy: API keys (`.env`), config (`config.yaml`), the FTS5 session database, installed skills, Honcho user models, agent memories, cron job definitions, and logs.
 
+There's a single container filesystem here, not a VM with a separate OS inside it — Render runs one Linux container from the image this repo's `Dockerfile` builds, and everything you can interact with (Hermes, Caddy, s6, the dashboard) lives inside that one filesystem. Within it, the split that actually matters is ephemeral vs. persistent: `/opt/hermes` (the Hermes binary, its Python venv, static assets) comes from the image layers and resets to its baked-in state on every redeploy, while `/opt/data` (`HERMES_HOME`) is the mounted persistent disk and is the only part that survives across deploys. The dashboard's file browser is scoped to `/opt/data`, not the whole container — that's why you'll see agent-owned files like `SOUL.md` there but never `/opt/hermes`; reaching the image-baked side requires SSH (see [Shell access](#shell-access)).
+
 ## Prerequisites
 
-You need:
+Each agent needs:
 
 - **An LLM provider API key.** [OpenRouter](https://openrouter.ai/keys) is the easiest because it routes to most providers behind a single key. Direct keys for Anthropic, OpenAI, Google, or Hugging Face also work.
 - **A Render account** with at least the `standard` plan ($25/month at time of writing). The free plan can't run this image; the `standard` plan has the memory headroom Hermes needs.
-
-Optional, depending on which channels you want Hermes to listen on:
-
-- **Telegram bot token** from [@BotFather](https://t.me/BotFather), plus your Telegram user ID from [@userinfobot](https://t.me/userinfobot).
-- **Discord bot token** from [discord.com/developers/applications](https://discord.com/developers/applications) (enable the Message Content Intent).
-- **Slack bot + app-level tokens** from [api.slack.com/apps](https://api.slack.com/apps) (Socket Mode requires both `xoxb-...` and `xapp-...`).
-
-You don't need any optional keys to deploy. You can fill them in via the Render Dashboard after the service is up.
-
-## Deploy
-
-### Option 1: Deploy button
-
-1. Click the **Deploy to Render** button above.
-2. Pick a workspace and a service name.
-3. Render reads `render.yaml`, generates a value for `HERMES_GATEWAY_TOKEN`, and creates the service. All other env vars start blank.
-4. The first deploy builds the image from the `Dockerfile`. Expect ~3 to 5 minutes for the upstream pull (~2.6 GB compressed) plus our thin tooling layer, then ~1 minute for the gateway to boot.
-
-### Option 2: Manual Blueprint sync
-
-1. Fork this repo.
-2. In the Render Dashboard, go to **Blueprints** → **New Blueprint Instance** and point at your fork.
-3. Confirm and apply.
-
-### Protect the URL before configuring
-
-As of the June 2026 upstream hardening, the dashboard **does** have built-in authentication, and it fails closed: on a non-loopback bind (`HERMES_DASHBOARD_HOST=0.0.0.0`, which this Blueprint sets) the auth gate engages and the dashboard *refuses to bind* unless an auth provider is registered. `HERMES_DASHBOARD_INSECURE` no longer disables it — the flag is accepted and ignored.
-
-That means a fresh deploy needs `HERMES_DASHBOARD_BASIC_AUTH_USERNAME` + `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD` (plus `HERMES_DASHBOARD_BASIC_AUTH_SECRET` to sign sessions) set from the **Environment** tab, or the dashboard won't come up and the health check will fail. They're `sync: false` in the Blueprint, so Render never overwrites them.
-
-Built-in auth is a real gate, not a substitute for thinking about exposure — the dashboard is still an admin surface holding your provider keys and a PTY into the container. Consider going further:
-
-- Put the service behind an auth gateway that verifies a bearer token, OAuth session, or trusted identity provider.
-- Keep the dashboard reachable only through a private network path, such as Tailscale.
-- Accept the risk for a demo, use low-privilege keys, and delete the service when you're done.
-
-Read the **Security** section before you paste production API keys.
+- **A connection to a channel for Hermes to listen on**. Ex. Slack, Telegram, Line.
 
 ## Post-deploy setup
 
-Once the service is healthy (the **Events** tab shows "Deploy live"), open the URL Render assigned (it ends in `.onrender.com`). You'll see the Hermes dashboard.
+Once the service is healthy (the **Events** tab shows "Deploy live"), open the URL Render assigned (it ends in `.onrender.com`). We'll see the Hermes dashboard.
 
 The Blueprint deliberately keeps the env-var surface tiny. All provider keys, tool keys, and chat platform tokens are set from the dashboard, not from `render.yaml`. The dashboard writes everything to `/opt/data/.env`, which lives on the persistent disk and survives redeploys.
 
 Walk through these tabs in order:
 
 1. **API Keys**. Paste a key for at least one LLM provider. Pick one:
-   - `OPENROUTER_API_KEY` from [openrouter.ai/keys](https://openrouter.ai/keys) routes to most providers behind a single key
-   - `ANTHROPIC_API_KEY` from [console.anthropic.com](https://console.anthropic.com) for Claude models direct
-   - `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `HF_TOKEN`, etc. for the others
-2. **Config**. Set the `model` field at the top of the list. The upstream image's default is `anthropic/claude-opus-4.6`, which works as soon as you've set `ANTHROPIC_API_KEY`. Otherwise pick a model your provider supports (for example, `anthropic/claude-sonnet-4.6` for Anthropic, or any OpenRouter model ID like `openai/gpt-5.5`).
-3. **Status**. Confirm the gateway is running and the model is reachable. The "Connected platforms" list will be empty until you add a chat platform.
-4. **API Keys** again, optionally. If you want a chat gateway, add the matching tokens: `TELEGRAM_BOT_TOKEN`, `DISCORD_BOT_TOKEN`, `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN`, etc. Use the **Restart gateway** button on the Status tab so the new tokens are picked up.
+2. **Config**. Set the `model` field at the top of the list. 
+3. **Status**. Confirm the gateway is running and the model is reachable. The "Connected platforms" list will be empty until we add a chat platform.
+4. **API Keys** 
 
-If you'd rather set keys from the Render Dashboard's **Environment** tab (handy for CI or secrets-manager workflows), that path also works: Render env vars override `/opt/data/.env` at process start. Pick one path and stick with it to avoid drift.
+If we'd rather set keys from the Render Dashboard's **Environment** tab (handy for CI or secrets-manager workflows), that path also works: Render env vars override `/opt/data/.env` at process start. We should probably pick one path and stick with it to avoid drift.
 
 ### Where the "gateway token" fits
 
@@ -156,7 +119,7 @@ LLM costs are separate and depend entirely on your provider and usage. OpenRoute
 The pinned Hermes version lives in the [`Dockerfile`](Dockerfile) as a build arg:
 
 ```dockerfile
-ARG HERMES_IMAGE=docker.io/nousresearch/hermes-agent:v2026.5.7
+ARG HERMES_IMAGE=docker.io/nousresearch/hermes-agent:v2026.?.?.?
 ```
 
 Bump it, then **run the smoke test before you deploy**:

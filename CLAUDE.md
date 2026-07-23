@@ -1,8 +1,5 @@
 # CLAUDE.md — hermes-render
 
-Project-specific instructions for this repo. See `~/.claude/CLAUDE.md` for
-the system-wide rules this extends.
-
 ## What this repo is
 
 A Docker template for deploying one [Hermes Agent](https://github.com/NousResearch/hermes-agent)
