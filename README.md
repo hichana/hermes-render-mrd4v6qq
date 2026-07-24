@@ -42,7 +42,7 @@ A single container runs both Hermes processes under [s6-overlay](https://github.
 
 > **Do not override the image's `ENTRYPOINT`.** Boot-time work belongs in an `/etc/cont-init.d/` hook. Overriding `ENTRYPOINT` is what broke the v2026.5.7 → v2026.7.7.2 upgrade: `/usr/bin/tini` is now a symlink to `/init`, so an old `tini -g -- ...` ENTRYPOINT resolved to `/init -g -- …`, s6 tried to run `-g` as the main program, and the boot failed — while the container stayed up and the health check kept passing. Run [`scripts/smoke-test.sh`](scripts/smoke-test.sh) after any `HERMES_IMAGE` bump.
 
-Hermes also supports **one gateway process per profile**: each profile gets its own `/run/service/gateway-<name>` service, reconciled on every boot from that profile's `gateway_state.json` on the disk. Each runs with its own `HERMES_HOME` and its own `.env`, so per-profile settings (including port-binding platforms like LINE) stay independent. For our purposes, we will only run one agent/gateway per business.
+Hermes also supports **one gateway process per profile**: each profile gets its own `/run/service/gateway-<name>` service, reconciled on every boot from that profile's `gateway_state.json` on the disk. Each runs with its own `HERMES_HOME` and its own `.env`, so per-profile settings (including port-binding platforms like LINE) stay independent. For our purposes, we will only run one agent/gateway per business. If a stray second profile ever does show up (e.g. from testing), see "[Deleting a profile safely](#deleting-a-profile-safely)" before removing it — `hermes profile delete` alone is not sufficient.
 
 The disk holds everything that should survive a redeploy: API keys (`.env`), config (`config.yaml`), the FTS5 session database, installed skills, Honcho user models, agent memories, cron job definitions, and logs.
 
@@ -190,6 +190,33 @@ Check the **Events** tab for the deploy that failed, then the **Logs** tab aroun
 | `Refusing to bind dashboard to 0.0.0.0 — … no auth providers are registered` | Expected, and it fails closed. Set `HERMES_DASHBOARD_BASIC_AUTH_USERNAME` + `_PASSWORD` from the Environment tab. |
 | Dashboard **Chat** tab shows "Chat unavailable: 1" or hangs / 500s on `/api/pty` | `/opt/hermes/ui-tui/` and `node_modules/` still ship root-owned while the dashboard runs as `hermes` ([#20500](https://github.com/NousResearch/hermes-agent/issues/20500)), so a runtime esbuild rebuild fails with `EACCES`. The Dockerfile chowns them at build time; if you've forked and removed that line, restore it. (The old `touch ink-bundle.js` / `entry.js` workarounds are no longer needed as of v2026.7.7.2: `_hermes_ink_bundle_stale()` and `_tui_build_needed()` are gone, and the image ships a prebuilt `ui-tui/dist/entry.js`.) |
 | `tirith security scanner enabled but not available`  | Harmless. Tirith is an optional Rust-based command scanner; without it, Hermes uses pattern matching. Ignore unless you specifically want native scanning. |
+| Two profiles both trying to run the same port-binding platform (e.g. LINE), one stuck retrying `bind_failed` forever, or a deleted profile's directory reappears after a restart | See "[Deleting a profile safely](#deleting-a-profile-safely)" below. |
+
+### Deleting a profile safely
+
+**Confirmed in practice (2026-07-24): `hermes profile delete <name>` does not reliably kill the profile's running gateway process.** It removes the profile's files and updates Hermes' own bookkeeping (`hermes profile list` will report it "stopped" or gone entirely), but the underlying OS process can keep running. On Render, you can't clean up after this the way you would locally — SSH access there runs as UID 0 but **without `CAP_KILL`** into the main container's process tree, so `kill`/`os.kill()` against the orphaned PID fails with `PermissionError: Operation not permitted` even as root, and `s6-svc -d` fails with "No such file or directory" if the service's control path was already torn down by the deletion.
+
+Left alone, that orphaned process is actively harmful, not just idle: through its own normal housekeeping writes (session state, logs, `gateway_state.json`), it will **recreate its own profile directory** on disk within minutes. The next container restart's boot-time reconciler (`hermes_cli/container_boot.py`, wired as `/etc/cont-init.d/02-reconcile-profiles`) walks every directory under `$HERMES_HOME/profiles/` and re-registers an s6 service for anything with a `SOUL.md` — so it will faithfully resurrect a `gateway-<name>` service for a profile you already "deleted."
+
+Safe procedure:
+
+1. **Stop the gateway first, and verify it's actually gone**, before deleting anything:
+   ```bash
+   /opt/hermes/.venv/bin/hermes -p <name> gateway stop
+   ps aux | grep "hermes -p <name>"   # must print nothing
+   ```
+2. Only then run `hermes profile delete <name> --yes`.
+3. If step 1's `ps` check ever does show a lingering process after `gateway stop` (or you skip straight to `delete` and find one afterward) — don't fight it over SSH. **Restart the service from the Render Dashboard** (or `render deploys create` a no-op redeploy). This is the only reliable way to clear an orphaned gateway process on Render; the container's tmpfs `/run/service/` is wiped on restart, and the reconciler will not recreate a slot for a profile whose directory is genuinely gone.
+4. After the restart, confirm with `hermes profile list` that only the profiles you expect are present, and re-run step 2's deletion again if the directory got resurrected in the gap before the restart.
+
+If you want the conversation history a deleted profile was holding (sessions, memories), get it out *before* deleting:
+
+```bash
+hermes profile export <name>                              # full backup archive, cheap insurance
+hermes -p <name> sessions export --format md \
+  --session-id <id> <output-dir> --yes                     # human-readable transcript
+```
+Memory files (`memories/USER.md`, `memories/MEMORY.md`) are just markdown — worth diffing against the profile you're keeping and merging anything genuinely useful (not boilerplate carried over from a `--clone`) before the source profile is gone.
 
 ### Changing env vars
 

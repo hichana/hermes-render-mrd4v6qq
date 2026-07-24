@@ -31,7 +31,7 @@ FROM ${HERMES_IMAGE}
 USER root
 COPY patches/line-dm-pairing.patch /tmp/line-dm-pairing.patch
 RUN cd /opt/hermes && git apply -p1 --verbose /tmp/line-dm-pairing.patch \
- && rm /tmp/line-dm-pairing.patch
+     && rm /tmp/line-dm-pairing.patch
 
 # The dashboard runs as `hermes`, but ui-tui/ and node_modules/ still ship
 # root-owned (upstream #20500). Without this the Chat tab's runtime esbuild
@@ -89,18 +89,18 @@ RUN chmod 0755 /opt/render-tools/patch-config.py /opt/render-tools/seed-env-from
 # reproduces only under such a runtime, not on stock `docker run`.
 COPY --from=caddy /usr/bin/caddy /tmp/caddy.orig
 RUN cat /tmp/caddy.orig > /usr/bin/caddy \
- && chmod 0755 /usr/bin/caddy \
- && rm /tmp/caddy.orig
+     && chmod 0755 /usr/bin/caddy \
+     && rm /tmp/caddy.orig
 COPY --chown=root:root caddy/Caddyfile /etc/caddy/Caddyfile
 COPY --chown=root:root caddy/s6-rc.d/caddy /etc/s6-overlay/s6-rc.d/caddy
 # Register with the `user` bundle, alongside upstream's dashboard and
 # main-hermes services. An empty file named after the service is how s6-rc
 # declares bundle membership.
 RUN chmod 0755 /etc/s6-overlay/s6-rc.d/caddy/run /etc/s6-overlay/s6-rc.d/caddy/finish \
- && touch /etc/s6-overlay/s6-rc.d/user/contents.d/caddy \
- && install -d -o hermes -g hermes -m 0755 \
-      /var/lib/caddy /var/lib/caddy/.config /var/lib/caddy/.local/share \
- && caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+     && touch /etc/s6-overlay/s6-rc.d/user/contents.d/caddy \
+     && install -d -o hermes -g hermes -m 0755 \
+     /var/lib/caddy /var/lib/caddy/.config /var/lib/caddy/.local/share \
+     && caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 
 # Pre-create HERMES_HOME so chown works cleanly on first boot. The
 # mounted disk replaces this empty dir at runtime; baking it just keeps
