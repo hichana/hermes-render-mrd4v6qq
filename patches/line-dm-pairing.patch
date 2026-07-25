@@ -351,7 +351,7 @@ index 447cf5f..695cb93 100644
  
          if event_type == "message":
              await self._handle_message_event(event)
-@@ -929,6 +1193,67 @@ class LineAdapter(BasePlatformAdapter):
+@@ -929,6 +1193,74 @@ class LineAdapter(BasePlatformAdapter):
          else:
              logger.debug("LINE: ignoring event type %r", event_type)
  
@@ -391,7 +391,14 @@ index 447cf5f..695cb93 100644
 +                time.time() + LINE_REPLY_TOKEN_TTL_SECONDS,
 +            )
 +
-+        display_name = uid
++        # Prefer LINE's own live profile (most authoritative, most current),
++        # then the name the manager supplied when minting the invite
++        # (skills/line-invite requires this — see its SKILL.md), and only
++        # fall back to the raw user ID if both are unavailable. Falling
++        # back straight to `uid` here was the original bug: it silently
++        # produced "Approved users" entries where the name column just
++        # repeated the ID, with no indication a real name was ever known.
++        display_name = entry.get("label") or uid
 +        if self._client:
 +            profile = await self._client.get_profile(uid)
 +            if profile and profile.get("displayName"):

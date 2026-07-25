@@ -45,6 +45,19 @@ channel.
   `hermes pairing approve line <code>` — a different, existing flow this
   skill doesn't replace) or inviting to any platform other than LINE.
 
+## Before generating: get the invitee's real name
+
+`--label` is not just a note to yourself — it's what the LINE adapter
+records as the invitee's display name in "Approved users" if LINE's own
+profile lookup doesn't resolve in time (a real, observed failure mode).
+**If the current user hasn't already told you the invitee's actual name
+in this conversation, ask for it before running the script.** Don't
+invent a placeholder ("New hire", "Guest", their role alone, etc.) and
+don't proceed on a role-only description like "the new cashier" — get
+the person's name first. This is the difference between a usable
+Approved-users list and one where an entry's name is just a repeat of
+their LINE user ID.
+
 ## Generating an invite
 
 Run the bundled script with the Hermes venv's Python (needed for the
@@ -57,8 +70,11 @@ Run the bundled script with the Hermes venv's Python (needed for the
   --hours 48
 ```
 
-- `--label`: whatever identifies this invite to a human later (name +
-  role is typical). Shows up in the "they joined!" notification.
+- `--label`: the invitee's actual name, optionally with role for your own
+  reference (e.g. "Jamie - PT cashier"). Required, and must lead with a
+  real name, not a role or placeholder — see above. Shows up in the
+  "they joined!" notification, and doubles as the fallback display name
+  in "Approved users" on the dashboard.
 - `--created-by`: pass the *current* chat's LINE user ID if this
   conversation is itself happening on LINE (you'll have it from the
   message source). If the manager is talking to you on a different
@@ -108,9 +124,15 @@ another skill invocation or any further action from you.
    marks it redeemed on first match) — mint a fresh invite per person,
    don't reuse or hand out the same QR to multiple candidates expecting
    it to work more than once.
+5. **Running `--label` with a role instead of a name.** "the new cashier"
+   or "Guest" is not enough — ask the current user for the invitee's
+   actual name first (see "Before generating" above). A role-only label
+   ends up as the name shown in Approved users if LINE's profile lookup
+   doesn't resolve in time.
 
 ## Verification Checklist
 
+- [ ] The invitee's actual name was obtained from the current user (not a role or placeholder) before generating
 - [ ] `LINE_BASIC_ID` was set (script didn't error)
 - [ ] The QR PNG at `qr_path` was sent to the current user, not just described
 - [ ] `--created-by` was passed if this conversation is itself on LINE

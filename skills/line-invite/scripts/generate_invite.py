@@ -40,7 +40,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--label", required=True,
-        help="Human-readable label for who this invite is for, e.g. 'Jamie - PT cashier'",
+        help="The invitee's actual name (role optional), e.g. 'Jamie - PT cashier'. "
+             "Required: the LINE adapter uses this as the approved-user's display "
+             "name whenever LINE's own profile lookup doesn't resolve in time, so "
+             "a role-only or placeholder value here leaks into 'Approved users'.",
     )
     parser.add_argument(
         "--created-by", default="",

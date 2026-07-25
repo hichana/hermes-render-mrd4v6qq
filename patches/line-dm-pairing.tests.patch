@@ -10,7 +10,7 @@ index 9d897ce..2a73a2c 100644
  
  
  # ---------------------------------------------------------------------------
-@@ -674,3 +675,342 @@ class TestMessageTypeMapping:
+@@ -674,3 +675,375 @@ class TestMessageTypeMapping:
      def test_unknown_type_falls_back_to_text(self):
          MessageType = _line.MessageType
          assert _line._LINE_MESSAGE_TYPES.get("flex", MessageType.TEXT) == MessageType.TEXT
@@ -292,6 +292,39 @@ index 9d897ce..2a73a2c 100644
 +        notify_calls = [c for c in adapter.send.await_args_list if c.args[0] == "Umanager"]
 +        assert len(notify_calls) == 1
 +        assert "Jamie" in notify_calls[0].args[1]
++
++    def test_approved_name_falls_back_to_invite_label_not_raw_user_id(self, monkeypatch, tmp_path):
++        # Regression guard: this adapter's own get_profile() lookup can fail
++        # (unconnected client, LINE API hiccup, etc.) — when it does, the
++        # approved-user record must fall back to the name the manager
++        # supplied when minting the invite, not silently repeat the LINE
++        # user ID as both the ID and the "name". The bug this guards
++        # against shipped two real Approved-users entries where the name
++        # column was just the ID again.
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        adapter = self._make_adapter(monkeypatch)
++        adapter._client = None  # no LINE profile lookup available
++        token = adapter._invites.mint("Jamie", "Umanager")
++
++        from gateway.pairing import PairingStore
++        captured = {}
++        original_approve_user = PairingStore._approve_user
++
++        def spy_approve_user(self, platform, uid, name):
++            captured["name"] = name
++            return original_approve_user(self, platform, uid, name)
++
++        monkeypatch.setattr(PairingStore, "_approve_user", spy_approve_user)
++
++        event = {
++            "type": "message",
++            "source": {"type": "user", "userId": "Ucandidate"},
++            "message": {"type": "text", "text": token},
++            "replyToken": "rt-1",
++        }
++        asyncio.run(adapter._dispatch_event(event))
++
++        assert captured["name"] == "Jamie"
 +
 +    def test_invalid_token_falls_through_to_pairing_handler_unchanged(self, monkeypatch, tmp_path):
 +        monkeypatch.setenv("HERMES_HOME", str(tmp_path))

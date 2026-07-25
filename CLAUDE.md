@@ -1,14 +1,22 @@
 # CLAUDE.md — hermes-render
 
+## About NGraph
+
+NGraph is a company that focuses on bespoke AI integrations for businesses based in Fukui and Ishikawa prefectures, Japan. Our broader goal is to develop a SaaS offering spawned from our experience building solutions for businesses and supplant our integrations business with one that is more scaleable. 
+
+NGraph members:
+Singo Takahashi -- CEO
+Matt Chana -- CTO
+
 ## What this repo is
 
-A Docker template for deploying one [Hermes Agent](https://github.com/NousResearch/hermes-agent) instance per client business on Render. Each deployed instance is client-facing. **Only admins provision or manage Render resources** — never a deployed agent instance. As of the Render-tooling removal (see `plans/strip-render-tooling-plan.md` if it's still present locally; it's gitignored), this image carries no Render account access at all: no MCP server, no Render API key, no `render` CLI.
+A Docker template for deploying one [Hermes Agent](https://github.com/NousResearch/hermes-agent) instance per client business on Render. Each deployed instance is client-facing. **Only admins provision or manage Render resources** — never a deployed agent instance. Each image should carry no Render account access at all: no MCP server, no Render API key, no `render` CLI.
 
 ## Debugging a deployed instance over SSH (admin-only)
 
 This is separate from the image itself (which, per above, has zero Render account access baked in) — it's Matt/admin tooling for inspecting a running instance from the outside, e.g. reading pairing/allowlist state that only exists on the instance's persistent volume, not in this repo.
 
-- **Key**: `~/.ssh/render_hermes` (private) / `~/.ssh/render_hermes.pub` (comment `matt-render-hermes-debug`), added to the target Render service's SSH public keys in the dashboard.
+- **Key**: `~/.ssh/render_hermes` (private) / `~/.ssh/render_hermes.pub`.
 - **Connect**: `ssh -i ~/.ssh/render_hermes <service-id>@ssh.oregon.render.com` — the "user" in the SSH target *is* the Render service ID (`srv-...`), not an account username. Find it on the service's page in the Render dashboard. Lands you in the container as `root`.
 - Render's SSH gateway throws a `bad signature for ED25519 key` warning on the *host* key during connect (proxy behavior, not a MITM) — noisy but harmless; it still authenticates and connects fine.
 - Once in, Hermes' persistent state lives under `/opt/data`, owned by the `hermes` user. Relevant to LINE pairing/allowlist debugging specifically:
