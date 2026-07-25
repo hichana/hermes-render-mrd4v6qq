@@ -33,10 +33,13 @@ USER root
 # Basic vim for admin SSH debugging (repo CLAUDE.md's "Debugging a deployed
 # instance over SSH" section) -- not present in the upstream base image.
 # vim-tiny keeps the footprint small; swap for `vim` if you need full
-# features (clipboard, python, etc).
+# features (clipboard, python, etc). vim-tiny's postinst only registers
+# alternatives for vi/view/ex/editor, not `vim` itself, so add that symlink
+# by hand or `vim` comes back as "command not found".
 RUN apt-get update \
     && apt-get install -y --no-install-recommends vim-tiny \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/bin/vim.tiny /usr/bin/vim
 
 COPY patches/line-dm-pairing.patch /tmp/line-dm-pairing.patch
 RUN cd /opt/hermes && git apply -p1 --verbose /tmp/line-dm-pairing.patch \
