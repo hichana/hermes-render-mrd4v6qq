@@ -40,6 +40,8 @@ import os
 # beats a blanket passthrough for anything that touches process env.
 SEEDABLE_VARS = [
     "LINE_BASIC_ID",
+    "LINE_PUBLIC_URL",
+    "LINE_SLOW_RESPONSE_THRESHOLD",
 ]
 
 
