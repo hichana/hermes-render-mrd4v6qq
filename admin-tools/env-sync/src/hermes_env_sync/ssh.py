@@ -11,6 +11,7 @@ already use for manual debugging per SERVICES.md.
 from __future__ import annotations
 
 import subprocess
+import time
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -19,6 +20,15 @@ REMOTE_ENV_TMP_PATH = "/opt/data/.env.hermes-env-sync.tmp"
 REMOTE_PID_PATH = "/opt/data/gateway.pid"
 SSH_CONNECT_TIMEOUT = 10
 SSH_COMMAND_TIMEOUT = 30
+
+# Render's SSH gateway occasionally drops a fresh connection outright
+# ("Connection reset by peer") or a one-shot command intermittently fails
+# for no reason tied to our command (observed live, 2026-07-27, on plain
+# `cat` calls). Read-only commands are safe to retry blindly since they have
+# no side effects; a couple of quick retries turns a flaky connection into
+# a non-issue instead of aborting a whole push partway through.
+READ_RETRY_ATTEMPTS = 3
+READ_RETRY_DELAY_SECONDS = 2
 
 
 class SSHError(RuntimeError):
@@ -73,7 +83,18 @@ class SSHTransport:
         return proc.stdout
 
     def read_file(self, path: str) -> str:
-        return self._run(f"cat {path}")
+        # Retried: read-only and idempotent, so a flaky connection here just
+        # costs a couple of seconds rather than aborting the whole push.
+        last_error: SSHError | None = None
+        for attempt in range(1, READ_RETRY_ATTEMPTS + 1):
+            try:
+                return self._run(f"cat {path}")
+            except SSHError as exc:
+                last_error = exc
+                if attempt < READ_RETRY_ATTEMPTS:
+                    time.sleep(READ_RETRY_DELAY_SECONDS)
+        assert last_error is not None
+        raise last_error
 
     def write_file_atomic(self, path: str, tmp_path: str, content: str) -> None:
         self._run(f"cat > {tmp_path}", input_text=content)
