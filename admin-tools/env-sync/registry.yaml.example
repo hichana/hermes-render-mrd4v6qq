@@ -1,0 +1,9 @@
+# Copy this file to clients/registry.yaml (gitignored) and fill in real
+# clients. Maps a client slug -> the Render SSH connection string for that
+# client's instance (see repo SERVICES.md for where this comes from).
+default_ssh_key: ~/.ssh/render_hermes
+
+clients:
+  acme-co:
+    ssh_target: srv-xxxxxxxxxxxxxxxxxxxx@ssh.oregon.render.com
+    # ssh_key: ~/.ssh/some_other_key   # optional per-client override

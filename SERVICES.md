@@ -11,3 +11,7 @@ This is separate from the image itself (which, per above, has zero Render accoun
   - `/opt/data/platforms/line-invites/invites.json` — one-off QR invite tokens from the `line-invite` skill, redeemed or not.
 - Treat this as read-only unless the task explicitly calls for a change — this is a live client-facing instance, not a dev box.
 
+## Managing per-client env vars and secrets
+
+The manual SSH poking above is for ad-hoc, read-only debugging. For deliberate, ongoing changes to a client's business config or secrets (LINE tokens, allowlists, `LINE_BASIC_ID`, etc.), use [`admin-tools/env-sync`](admin-tools/env-sync/README.md) instead — a different, scripted SSH-based workflow that does a targeted upsert into `/opt/data/.env` plus a verified gateway restart, rather than a hand edit.
+

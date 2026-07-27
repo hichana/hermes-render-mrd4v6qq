@@ -56,6 +56,8 @@ Each agent needs:
 - **A Render account** with at least the `standard` plan ($25/month at time of writing). The free plan can't run this image; the `standard` plan has the memory headroom Hermes needs.
 - **A connection to a channel for Hermes to listen on**. Ex. Slack, Telegram, Line.
 
+For ongoing per-client config management (as opposed to first-time setup), see [`admin-tools/env-sync`](admin-tools/env-sync/README.md).
+
 ## Post-deploy setup
 
 Once the service is healthy (the **Events** tab shows "Deploy live"), open the URL Render assigned (it ends in `.onrender.com`). We'll see the Hermes dashboard.
@@ -69,13 +71,11 @@ Walk through these tabs in order:
 3. **Status**. Confirm the gateway is running and the model is reachable. The "Connected platforms" list will be empty until we add a chat platform.
 4. **API Keys** 
 
-If we'd rather set keys from the Render Dashboard's **Environment** tab (handy for CI or secrets-manager workflows), that mostly also works — but confirmed in practice (2026-07-23) that it's not equivalent for everything: Hermes' own skill-readiness checks (e.g. the `line-invite` skill's `LINE_BASIC_ID` requirement, see below) read `/opt/data/.env` first and don't reliably fall back to a Render-Environment-tab-only value. For anything a skill or plugin declares as a required/optional env var, set it from the dashboard, not the Environment tab.
+For ongoing or scripted config management — rotating a key, onboarding a new client's LINE credentials, updating an allowlist — don't use the dashboard *or* the Render Environment tab by hand. Use [`admin-tools/env-sync`](admin-tools/env-sync/README.md), an admin-run CLI that upserts values straight into `/opt/data/.env` over SSH and verifies the gateway actually restarted. (Historical note: Render's Environment tab used to be a supported one-shot way to seed a couple of per-instance values, via a boot-time script that copied them into `.env` on first boot only. That mechanism silently went stale on any later edit — Hermes loads `.env` with `override=True`, so once a key landed in `.env` the Environment tab became permanently inert for it — and has been replaced by `env-sync`.)
 
 ### LINE Basic ID (per instance)
 
-If this instance uses the `line-invite` skill (manager-initiated QR join invites), it needs `LINE_BASIC_ID` — the channel's public LINE Basic ID (LINE Developers Console → Messaging API → Basic Settings, e.g. `@abc1234`) — set in the dashboard's **API Keys** tab. It's not a secret, just per-instance config, but it has to land in `/opt/data/.env` the same way provider keys do; see the note above for why the Environment tab alone isn't enough.
-
-To automate this per new client instance instead of visiting the dashboard by hand: set `LINE_BASIC_ID` as a plain Render **Environment**-tab var when you provision the service. A boot-time hook (`scripts/seed-env-from-render.py`, installed via the Dockerfile) copies it into `/opt/data/.env` automatically on first boot — idempotent, and it never overwrites a value you later change from the dashboard. See the Dockerfile's `line-invite skill` comment block for how this is wired up.
+If this instance uses the `line-invite` skill (manager-initiated QR join invites), it needs `LINE_BASIC_ID` — the channel's public LINE Basic ID (LINE Developers Console → Messaging API → Basic Settings, e.g. `@abc1234`). It's not a secret, just per-instance config, but it has to land in `/opt/data/.env` the same way provider keys do. Add it to `clients/<slug>.env` and run `hermes-env-sync push <slug>` (see `admin-tools/env-sync/README.md`).
 
 ### Where the "gateway token" fits
 

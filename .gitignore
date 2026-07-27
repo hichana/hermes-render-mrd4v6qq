@@ -3,6 +3,13 @@
 .env.local
 .env.*.local
 
+# Per-client SSH targets + real business config/secrets read by
+# admin-tools/env-sync. Never commit.
+/clients/
+
+# Backups written by admin-tools/env-sync before each remote write.
+admin-tools/env-sync/.backups/
+
 # SSH keys, certificates, anything secret-shaped. Never commit.
 *.pem
 *.key
