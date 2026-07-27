@@ -66,3 +66,42 @@ def test_quoting_style_preserved_from_local_raw_line():
     new_text, diff, _ = upsert(remote, local)
     assert 'FOO="quoted value"' in new_text
     assert diff.changed == [("FOO", "FOO=old", 'FOO="quoted value"')]
+
+
+def test_deleting_local_line_does_not_remove_it_remotely():
+    # The gotcha this test guards: just removing a KEY=value line from the
+    # local file must NOT delete it remotely -- that's ambiguous with
+    # "never had an opinion on this key" (e.g. dashboard-managed values).
+    remote = "FOO=old\nPOOP=poop\n"
+    local = "FOO=old\n"
+    new_text, diff, _ = upsert(remote, local)
+    assert "POOP=poop" in new_text
+    assert not diff.has_changes
+
+
+def test_bang_marker_removes_key_remotely():
+    remote = "FOO=old\nPOOP=poop\n"
+    local = "FOO=old\n!POOP\n"
+    new_text, diff, _ = upsert(remote, local)
+    assert "POOP" not in new_text
+    assert diff.removed == ["POOP"]
+    assert diff.has_changes
+
+
+def test_bang_marker_for_absent_key_is_a_noop():
+    remote = "FOO=old\n"
+    local = "FOO=old\n!NEVER_EXISTED\n"
+    new_text, diff, _ = upsert(remote, local)
+    assert new_text == remote
+    assert diff.removed == []
+    assert not diff.has_changes
+
+
+def test_bang_marker_wins_over_a_set_for_same_key():
+    remote = "FOO=old\n"
+    local = "FOO=new\n!FOO\n"
+    new_text, diff, warnings = upsert(remote, local)
+    assert "FOO" not in new_text
+    assert diff.removed == ["FOO"]
+    assert diff.changed == []
+    assert any("FOO" in w for w in warnings)

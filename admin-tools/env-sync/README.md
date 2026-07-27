@@ -36,6 +36,19 @@ the restart actually happened, and tells you plainly whether it succeeded.
 Nothing else needs to be right in that file except the one line you
 changed — every other key you didn't touch is left exactly as-is.
 
+**To remove a key entirely, don't just delete its line.** Deleting a
+`KEY=value` line from the local file does *not* delete it remotely — that
+would be ambiguous with "I never had an opinion on this key" (e.g. a value
+set by hand through Hermes' own dashboard, which this file was never
+tracking in the first place). Instead, write a bang marker in its place:
+
+```
+!SOME_KEY_YOU_WANT_GONE
+```
+
+(literally `!` followed by the key name, no `=`). `push` will show it as a
+removal in the diff and actually delete that line from the remote `.env`.
+
 ## One-time setup (per client)
 
 ```sh
@@ -87,7 +100,8 @@ uv run --project admin-tools/env-sync hermes-env-sync list
    corresponding remote line, verbatim — quoting/spacing style and all.
    Every remote key **not** in your local file (e.g. something set by hand
    through Hermes' own dashboard) is left completely untouched, in its
-   original position.
+   original position. A `!KEY_NAME` line locally removes that key's line
+   from the remote file entirely (see "To remove a key entirely" above).
 3. Prints the diff. Secret-shaped keys (`*_TOKEN`, `*_KEY`, `*_SECRET`,
    `*_PASSWORD`) are redacted to a length + short hash fingerprint; every
    other key (allowlists, IDs, URLs) is shown in full, since you need to

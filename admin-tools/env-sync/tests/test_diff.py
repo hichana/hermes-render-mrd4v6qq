@@ -28,3 +28,10 @@ def test_added_key_shown():
     text = render(diff)
     assert "@abc1234" in text
     assert "(new)" in text
+
+
+def test_removed_key_shown():
+    diff = Diff(removed=["POOP"])
+    text = render(diff)
+    assert "POOP" in text
+    assert "(removed)" in text

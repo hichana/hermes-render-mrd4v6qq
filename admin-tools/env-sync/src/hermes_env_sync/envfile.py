@@ -4,14 +4,24 @@ Unlike the old boot-time seeder (insert-only, never overwrites), this is a
 deliberate replace-if-present upsert: every key present in the local client
 file always wins, on every run. That's the whole point — the seeder's
 insert-only guarantee is exactly the silent-drift bug this tool exists to
-fix. Any key NOT in the local file (e.g. something set by hand through
-Hermes' own dashboard) is left completely untouched, in its original
-position, byte-for-byte.
+fix. Any key NOT MENTIONED AT ALL in the local file (e.g. something set by
+hand through Hermes' own dashboard) is left completely untouched, in its
+original position, byte-for-byte — deleting a line from the local file does
+NOT delete it remotely, on purpose, since "never wrote an opinion on this
+key" and "wrote an opinion that it shouldn't exist" are different things and
+we can't tell them apart from a missing line alone.
+
+To actually remove a key from the remote .env, say so explicitly with a
+`!KEY_NAME` marker line (bang prefix, no `=`) instead of just deleting the
+`KEY_NAME=...` line. See DeleteLine below.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
+
+_DELETE_MARKER_RE = re.compile(r"^!([A-Za-z_][A-Za-z0-9_]*)$")
 
 
 @dataclass
@@ -25,18 +35,25 @@ class KVLine:
     text: str
 
 
-Line = RawLine | KVLine
+@dataclass
+class DeleteLine:
+    key: str
+    text: str
+
+
+Line = RawLine | KVLine | DeleteLine
 
 
 @dataclass
 class Diff:
     changed: list[tuple[str, str, str]] = field(default_factory=list)  # key, old_raw, new_raw
     added: list[tuple[str, str]] = field(default_factory=list)  # key, new_raw
+    removed: list[str] = field(default_factory=list)  # key
     unchanged_count: int = 0
 
     @property
     def has_changes(self) -> bool:
-        return bool(self.changed or self.added)
+        return bool(self.changed or self.added or self.removed)
 
 
 def _parse_key(line: str) -> str | None:
@@ -53,6 +70,10 @@ def _parse_key(line: str) -> str | None:
 def parse_lines(text: str) -> list[Line]:
     lines: list[Line] = []
     for raw in text.splitlines():
+        delete_match = _DELETE_MARKER_RE.match(raw.strip())
+        if delete_match:
+            lines.append(DeleteLine(key=delete_match.group(1), text=raw))
+            continue
         key = _parse_key(raw)
         if key is None:
             lines.append(RawLine(text=raw))
@@ -61,8 +82,12 @@ def parse_lines(text: str) -> list[Line]:
     return lines
 
 
-def _local_kv(local_lines: list[Line], warnings: list[str]) -> dict[str, str]:
-    result: dict[str, str] = {}
+def _local_directives(
+    local_lines: list[Line], warnings: list[str]
+) -> tuple[dict[str, str], set[str]]:
+    """Split local lines into (keys to set/replace, keys to delete)."""
+    set_kv: dict[str, str] = {}
+    delete_keys: set[str] = set()
     seen: set[str] = set()
     for line in local_lines:
         if isinstance(line, KVLine):
@@ -72,23 +97,35 @@ def _local_kv(local_lines: list[Line], warnings: list[str]) -> dict[str, str]:
                     "client file — last occurrence wins"
                 )
             seen.add(line.key)
-            result[line.key] = line.text
-    return result
+            set_kv[line.key] = line.text
+            delete_keys.discard(line.key)
+        elif isinstance(line, DeleteLine):
+            if line.key in seen:
+                warnings.append(
+                    f"key {line.key!r} is both set and marked !{line.key} "
+                    "for deletion in the local client file — deletion wins"
+                )
+            seen.add(line.key)
+            delete_keys.add(line.key)
+            set_kv.pop(line.key, None)
+    return set_kv, delete_keys
 
 
 def upsert(remote_text: str, local_text: str) -> tuple[str, Diff, list[str]]:
     """Upsert `local_text`'s keys into `remote_text`.
 
-    Returns (new_remote_text, diff, warnings). Every key present locally is
-    forced to the local file's exact raw line, in the remote file's existing
-    position if it already had that key, or appended (in local-file order)
-    if it didn't. Every remote key absent from the local file is passed
-    through completely unchanged, in its original position.
+    Returns (new_remote_text, diff, warnings). Every `KEY=value` line
+    present locally is forced to the local file's exact raw line, in the
+    remote file's existing position if it already had that key, or appended
+    (in local-file order) if it didn't. Every remote key absent from the
+    local file is passed through completely unchanged, in its original
+    position. A `!KEY_NAME` line locally removes that key's line from the
+    remote file entirely, if present.
     """
     warnings: list[str] = []
     remote_lines = parse_lines(remote_text)
     local_lines = parse_lines(local_text)
-    local_kv = _local_kv(local_lines, warnings)
+    local_kv, delete_keys = _local_directives(local_lines, warnings)
     remaining = dict(local_kv)
 
     diff = Diff()
@@ -98,6 +135,15 @@ def upsert(remote_text: str, local_text: str) -> tuple[str, Diff, list[str]]:
         if isinstance(line, RawLine):
             out.append(line.text)
             continue
+        if isinstance(line, DeleteLine):
+            # A remote file should never itself contain a `!KEY` marker line
+            # (those only mean something as a local directive) -- but if one
+            # somehow exists, treat it as inert text rather than crashing.
+            out.append(line.text)
+            continue
+        if line.key in delete_keys:
+            diff.removed.append(line.key)
+            continue  # drop this line entirely
         if line.key in remaining:
             new_text = remaining.pop(line.key)
             if new_text != line.text:
@@ -114,6 +160,9 @@ def upsert(remote_text: str, local_text: str) -> tuple[str, Diff, list[str]]:
             new_text = remaining.pop(line.key)
             diff.added.append((line.key, new_text))
             out.append(new_text)
+
+    # A !KEY marker for a key that was never present remotely is a no-op --
+    # nothing to remove, but not an error either.
 
     new_text = "\n".join(out)
     if new_text and not new_text.endswith("\n"):

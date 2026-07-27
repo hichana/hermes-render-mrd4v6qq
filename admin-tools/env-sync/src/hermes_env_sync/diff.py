@@ -49,6 +49,8 @@ def render(diff: Diff) -> str:
             lines.append(f"  + {key}: {_fingerprint(_value_of(new_raw))} (new)")
         else:
             lines.append(f"  + {key}: {_value_of(new_raw)!r} (new)")
+    for key in diff.removed:
+        lines.append(f"  - {key} (removed)")
     if not lines:
         return "(no changes)"
     lines.append(f"  ({diff.unchanged_count} other key(s) unchanged)")
