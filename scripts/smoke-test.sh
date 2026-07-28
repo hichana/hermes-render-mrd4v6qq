@@ -109,6 +109,39 @@ case "${code}" in
   *)       fail "/line/webhook/health returned unexpected ${code}" ;;
 esac
 
+# 6. The LINE group mention gate is wired. Two separate failure modes, both
+#    invisible in `docker logs`:
+#      (a) render_mention.py missing or landed at the wrong path — the COPY
+#          targets a directory inside the upstream package, which upstream is
+#          free to move;
+#      (b) present but not importable as part of the plugins.platforms.line
+#          package, which is exactly what the adapter's `from
+#          plugins.platforms.line import render_mention` needs. Asserting the
+#          real import (not just the file's existence) is the whole point:
+#          Hermes is an editable install, so importability is a property of
+#          the install layout, not of the file being on disk.
+docker exec "${CONTAINER}" test -f /opt/hermes/plugins/platforms/line/render_mention.py \
+  || fail "render_mention.py is missing from the image — the mention gate would fail at import"
+docker exec "${CONTAINER}" /opt/hermes/.venv/bin/python3 -c \
+  'import plugins.platforms.line.render_mention as m; assert m.MODE_MENTION == "mention"' \
+  >/dev/null 2>&1 \
+  || fail "render_mention.py is present but not importable as plugins.platforms.line.render_mention"
+echo "  ok: mention-gate module present and importable"
+
+# 7. The call-outs landed in the adapter AND the patched adapter still
+#    imports. The import half matters more than the grep: LINE is not
+#    configured in this smoke run, so the adapter is never instantiated at
+#    boot — an ImportError introduced by the patch would stay invisible here
+#    and first surface as a dead LINE channel on a live client instance.
+docker exec "${CONTAINER}" grep -q "_mention_gate" \
+  /opt/hermes/plugins/platforms/line/adapter.py \
+  || fail "adapter.py has no _mention_gate call-outs — line-group-mention.patch did not apply"
+docker exec "${CONTAINER}" /opt/hermes/.venv/bin/python3 -c \
+  'import plugins.platforms.line.adapter as a; assert a.render_mention.MODE_MENTION == "mention"' \
+  >/dev/null 2>&1 \
+  || fail "the patched LINE adapter does not import — the mention-gate call-outs are broken"
+echo "  ok: mention-gate call-outs present, patched adapter imports"
+
 # Note: there used to be a 6th check here confirming a boot-time seeder
 # copied a Render env var into /opt/data/.env. That mechanism (insert-only,
 # went silently stale on any later edit) was replaced by admin-tools/env-sync,

@@ -1,0 +1,86 @@
+diff --git a/plugins/platforms/line/adapter.py b/plugins/platforms/line/adapter.py
+index 0239b24..ba0d445 100644
+--- a/plugins/platforms/line/adapter.py
++++ b/plugins/platforms/line/adapter.py
+@@ -96,6 +96,7 @@ from gateway.platforms.base import (
+     cache_image_from_bytes,
+ )
+ from gateway.config import Platform
++from plugins.platforms.line import render_mention
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -942,6 +943,11 @@ class LineAdapter(BasePlatformAdapter):
+         # One-off join invites (Phase 6c) — manager-initiated QR invite flow.
+         self._invites = LineInviteStore()
+ 
++        # Group/room mention gate. All of the logic lives in the sibling
++        # render_mention module so upstream drift can only break the thin
++        # call-outs below, loudly, at build time. DMs are never gated.
++        self._mention_gate = render_mention.MentionGate()
++
+         # Runtime state
+         self._client: Optional[_LineClient] = None
+         self._app = None  # aiohttp.web.Application
+@@ -1270,6 +1276,23 @@ class LineAdapter(BasePlatformAdapter):
+         chat_id, chat_type = _resolve_chat(source)
+         user_id = source.get("userId", "") or chat_id
+ 
++        # Mention gate for group/room chats (DMs fall straight through).
++        # Deliberately ahead of the reply-token stash: tokens are
++        # single-use with a short TTL, so don't bank one from a message
++        # we're about to drop.
++        gate = self._mention_gate.evaluate(chat_type, chat_id, user_id, msg)
++        if gate.command is not None:
++            await self._mention_gate.handle_command(
++                self._client, gate.command, chat_id, user_id, reply_token
++            )
++            return
++        if not gate.allow:
++            logger.debug(
++                "LINE: ignoring %s message in %s from %s (%s)",
++                msg_type, chat_id, user_id, gate.reason,
++            )
++            return
++
+         # Stash the reply token for outbound use.
+         if chat_id and reply_token:
+             self._reply_tokens[chat_id] = (
+@@ -1285,6 +1308,8 @@ class LineAdapter(BasePlatformAdapter):
+ 
+         if msg_type == "text":
+             text = msg.get("text", "") or ""
++            if gate.stripped_text is not None:
++                text = gate.stripped_text
+         elif msg_type in {"image", "audio", "video", "file"}:
+             local_path = await self._download_media(message_id, msg_type)
+             if local_path:
+@@ -1338,6 +1363,12 @@ class LineAdapter(BasePlatformAdapter):
+         except (TypeError, json.JSONDecodeError):
+             return
+ 
++        if await self._mention_gate.handle_postback(
++            self._client, parsed, chat_id,
++            source.get("userId", "") or chat_id, reply_token,
++        ):
++            return
++
+         if parsed.get("action") != "show_response":
+             return
+         request_id = parsed.get("request_id", "")
+diff --git a/plugins/platforms/line/plugin.yaml b/plugins/platforms/line/plugin.yaml
+index 27f1bd2..45c624a 100644
+--- a/plugins/platforms/line/plugin.yaml
++++ b/plugins/platforms/line/plugin.yaml
+@@ -71,3 +71,11 @@ optional_env:
+     description: "This channel's public LINE Basic ID (LINE Developers Console > Messaging API > Basic ID, e.g. @abc1234). Used by the line-invite skill to build the manager-initiated QR join-invite deep link — not read by the adapter itself."
+     prompt: "LINE Basic ID (e.g. @abc1234)"
+     password: false
++  - name: LINE_REQUIRE_MENTION
++    description: "Default response mode for group/multi-person chats with no stored mode: true = reply only when @-mentioned (default), false = reply to every message. Per-group overrides set from inside the chat take precedence and apply without a restart. DMs are never gated."
++    prompt: "Require @mention in group chats? (true/false)"
++    password: false
++  - name: LINE_MENTION_FOLLOWUP_SECONDS
++    description: "After the bot answers an @mention in a group, that same user may follow up without mentioning again for this many seconds (default: 90; 0 disables). Also the only path by which stickers/images in a group are processed, since LINE attaches mention data to text messages only."
++    prompt: "Mention follow-up window (seconds)"
++    password: false

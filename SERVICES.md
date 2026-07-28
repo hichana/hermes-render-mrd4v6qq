@@ -9,6 +9,7 @@ This is separate from the image itself (which, per above, has zero Render accoun
   - `/opt/data/platforms/pairing/line-approved.json` — approved LINE user IDs + display names (this is the actual "allow list" for LINE DMs under `dm_policy: pairing`; see `patches/line-dm-pairing.patch`).
   - `/opt/data/platforms/pairing/line-pending.json` — outstanding pairing codes awaiting operator approval (may contain stale entries for since-approved users; harmless).
   - `/opt/data/platforms/line-invites/invites.json` — one-off QR invite tokens from the `line-invite` skill, redeemed or not.
+  - `/opt/data/platforms/line-modes/modes.json` — per-group response mode (`mention` = reply only when @-mentioned, `always` = reply to everything), plus who set it and when. Absent entry means the group follows the `LINE_REQUIRE_MENTION` default. This is the *only* place a group's mode lives — it is not mirrored in `.env`, and it is re-read on every message, so editing it takes effect immediately with no restart. Same backup-then-edit-then-confirm discipline as the other JSON stores if you touch it by hand; normally it's driven from inside the chat instead.
 - Treat this as read-only unless the task explicitly calls for a change — this is a live client-facing instance, not a dev box.
 
 ## Managing per-client env vars and secrets

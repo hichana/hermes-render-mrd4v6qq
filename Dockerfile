@@ -41,9 +41,17 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s /usr/bin/vim.tiny /usr/bin/vim
 
+# The mention-gate logic lives in an unpatched sibling module inside the LINE
+# plugin package — a plain COPY, no `git apply` — so upstream drift can only
+# break the ~20 lines of call-outs in line-group-mention.patch, and it breaks
+# them loudly here at build time. Order matters: line-group-mention.patch is
+# generated against a tree that already has line-dm-pairing.patch applied.
+COPY modules/line/render_mention.py /opt/hermes/plugins/platforms/line/render_mention.py
 COPY patches/line-dm-pairing.patch /tmp/line-dm-pairing.patch
+COPY patches/line-group-mention.patch /tmp/line-group-mention.patch
 RUN cd /opt/hermes && git apply -p1 --verbose /tmp/line-dm-pairing.patch \
-     && rm /tmp/line-dm-pairing.patch
+     && git apply -p1 --verbose /tmp/line-group-mention.patch \
+     && rm /tmp/line-dm-pairing.patch /tmp/line-group-mention.patch
 
 # The dashboard runs as `hermes`, but ui-tui/ and node_modules/ still ship
 # root-owned (upstream #20500). Without this the Chat tab's runtime esbuild
