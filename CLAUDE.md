@@ -1,4 +1,4 @@
-# CLAUDE.md — hermes-render
+# CLAUDE.md — hermes-render-mrd4v6qq
 
 See @SERVICES.md for connecting to admin services like SSH for accessing a Render service.
 
