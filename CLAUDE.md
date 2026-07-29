@@ -2,11 +2,9 @@
 
 See @SERVICES.md for connecting to admin services like SSH for accessing a Render service.
 
-See @PACKAGING.md for details on how a client service will be packaged for deployment.
-
 ## About NGraph
 
-NGraph is a company that focuses on bespoke AI integrations for businesses based in Fukui and Ishikawa prefectures, Japan. Our broader goal is to develop a SaaS offering spawned from our experience building solutions for businesses and supplant our integrations business with one that is more scaleable. 
+NGraph is a company that focuses on bespoke AI integrations for businesses primarily based in Fukui, Japan, tho strive to address a much wider market. Our broader goal is to develop a SaaS offering spawned from our experience building solutions for businesses and supplant our integrations business with one that is more scaleable. 
 
 NGraph members:
 Singo Takahashi -- CEO
@@ -14,35 +12,77 @@ Matt Chana -- CTO
 
 ## What this repo is
 
-A Docker template for deploying one [Hermes Agent](https://github.com/NousResearch/hermes-agent) instance per client business on Render. Each deployed instance is client-facing. **Only admins provision or manage Render resources** — never a deployed agent instance. Each image should carry no Render account access at all: no MCP server, no Render API key, no `render` CLI.
+A Docker template for deploying one [Hermes Agent](https://github.com/NousResearch/hermes-agent) instance per client business on Render. Each deployed instance is client-facing. **Only admins provision or manage Render resources** — never a deployed agent instance. 
 
-### Env-var allowlist edits vs. pairing-store approvals — different reload rules
+## How env vars work here
 
-Two mechanisms gate LINE (and other platform) DM access, and they do NOT reload the same way:
+### The three places a value can come from, and which one wins
 
-- **`{PLATFORM}_ALLOWED_USERS` / `_DM_POLICY` / `_ALLOW_ALL_USERS` env vars** are read once via `os.getenv()` at adapter construction (e.g. `LineAdapter.__init__` → `self.allowed_users`) and then cached for the process's lifetime. Editing `/opt/data/.env` does **nothing** to an already-running gateway — it requires an actual process restart to take effect. Use `admin-tools/env-sync push <slug>` for this (see its README) — it does the upsert into `/opt/data/.env` and the restart-and-verify in one step. Manual SSH edit followed by a separate manual restart is no longer the sanctioned path.
+1. **`render.yaml` (the Blueprint).** Deliberately tiny — only vars that change how the *container boots* (`HERMES_DASHBOARD*`, `HERMES_GATEWAY_TOKEN`). Anything secret or per-service is declared `sync: false`, meaning the Blueprint names the key but never carries its value; it's set once per service from Render's Environment tab and a Blueprint sync will not overwrite it.
+2. **Render's Environment tab.** Injected into the container's process environment at start. Saving here restarts the container.
+3. **`/opt/data/.env`** on the persistent disk (`HERMES_HOME`). Survives redeploys. Written by Hermes' own dashboard (API Keys tab), and by `admin-tools/env-sync`.
 
-- **Pairing-store approvals** (`hermes pairing approve/revoke`, or invite-token redemption via the `line-invite` skill) go through `PairingStore.is_approved()`, which re-reads its JSON file from disk on *every message* — no caching. These take effect immediately, never need a restart, and are the right tool for a quick revoke/re-grant test loop.
+**`.env` beats Render, always.** Hermes loads `$HERMES_HOME/.env` with `override=True` at gateway startup, so for any key that file contains — *including one with a blank value* — the Render-injected value is discarded. This is the single most important gotcha here: a key can be visibly correct in Render's Environment tab and have no effect whatsoever, silently, because a stale line for it exists in `.env`. (Note: `.env.example`'s closing paragraph currently states the precedence backwards; `README.md` and `admin-tools/env-sync/README.md` have it right.)
 
-- **Group response mode** (`/opt/data/platforms/line-modes/modes.json`, written by `GroupModeStore` in `modules/line/render_mention.py`) is a *third* mechanism, and it sits on the **no-restart** side with the pairing store, not with the env vars. `get_mode()` re-reads the file on every group message, deliberately, so the in-chat toggle (the Template Buttons bubble, or `mode always` / `mode mention` addressed to the bot) takes effect on the very next message. `LINE_REQUIRE_MENTION` and `LINE_MENTION_FOLLOWUP_SECONDS` are env vars and therefore *do* follow the restart rules above — but they only supply the default for a group the store has never seen. A stored mode always wins, so don't reach for `env-sync push` to change one group's behavior.
+Practical consequence: **treat `/opt/data/.env` as the source of truth for everything except container-boot config**, and don't hand-edit the Render tab for business config at all.
+
+### Historical: the boot-time seeder is gone
+
+There used to be a `scripts/seed-env-from-render.py` cont-init step that copied a couple of Render Environment-tab vars into `.env` on boot. It was **insert-only** (never overwrote), so it worked exactly once per key and then went permanently, silently inert — edit the Render tab afterwards and nothing happened. It was removed in favor of `env-sync`. Don't reintroduce a boot-time seeder for this.
+
+One live incident from it is still worth carrying forward: cont-init hooks under s6-overlay v3 do **not** see Render/docker `-e` env vars unless the shebang is `#!/command/with-contenv sh`. The seeder saw an empty value for its var purely because `bootstrap.sh` used plain `#!/bin/sh`. See Pattern 2 below.
+
+### Changing a client's env vars: `admin-tools/env-sync`
+
+The sanctioned path for every ongoing change — rotating a key, onboarding LINE credentials, editing an allowlist — is [`admin-tools/env-sync`](admin-tools/env-sync/README.md), an admin-machine-only CLI. Not the Hermes dashboard, not the Render tab, not a hand edit over SSH.
+
+- `clients/<slug>.env` is the local source of truth for the keys **it** manages; `clients/registry.yaml` maps slug → Render SSH target. Both are gitignored (real secrets), as is `.backups/`.
+- Workflow is: edit `clients/<slug>.env`, run `hermes-env-sync push <slug>`, read the printed diff, confirm.
+- It's a **targeted upsert**, not a file replacement: keys absent from your local file (e.g. anything set by hand through Hermes' dashboard) are left byte-for-byte untouched in place. That's why **deleting a line locally does not delete it remotely** — write a `!KEY_NAME` bang marker instead to actually remove a key.
+- `push` also backs up the pre-write remote `.env` to `.backups/`, restarts the gateway, verifies the restart really happened (below), and appends a row to `push-log.csv`. That CSV is **committed on purpose** — key names only, never values — and is the only record in git of when a live client instance last changed. Commit it alongside whatever prompted the push.
+- `diff <slug>` is read-only; `push --dry-run` previews; `restart-only <slug>` when `.env` is already right.
+
+### Env-var changes need a *verified* restart
+
+Hermes reads env vars once, via `os.getenv()`, at process start / adapter construction (e.g. `LineAdapter.__init__` → `self.allowed_users`), then caches them for the process's lifetime. Editing `/opt/data/.env` does **nothing** to a running gateway.
 
 **Don't trust a "restart requested" log line as proof a restart happened.** Confirmed live (2026-07-27): `hermes gateway restart` is a **silent no-op** on this deployment — the gateway runs as the container's bare main process (started by `main-wrapper.sh`, never through `hermes gateway install`), so `hermes gateway status` reports "Running manually, not as a system service," and the CLI's restart subcommand has no registered service to dispatch to. It exits 0 with zero output and changes nothing. The dashboard's own restart button (`POST /api/gateway/restart`) shells out to this identical subcommand, so it shares the bug — not a usable alternative either.
 
 What does work: sending `kill -USR1 <pid>` directly to the gateway's own pid — but **only as the `hermes` user**, not root. Root gets `Operation not permitted` even though it can freely `ps` the process: Render's runtime drops `CAP_KILL`, and `kill()` requires either a UID match or that capability — self-signaling as the owning user is always allowed regardless. As `hermes` (e.g. `/command/s6-setuidgid hermes kill -USR1 <pid>` — note `/command/s6-setuidgid`'s full path; it's not on an interactive SSH/Shell session's `PATH`), this is wired in `gateway/run.py` to `request_restart(via_service=True)`, which drains in-flight agent runs (up to `agent.restart_drain_timeout`, default 180s) then exits; the container's own s6 supervision relaunches it, producing a new pid. On an idle instance this completed in under 20s in testing — nowhere near the 180s ceiling — but don't assume that always holds under load.
 
-Either way, verify the same way: `cat /opt/data/gateway.pid` (compare `pid`/`start_time` before and after — both must differ) or `ps -o lstart -p <pid>` — if the PID is unchanged, the restart didn't happen. For an env-var change specifically, confirm in `logs/gateway.log` that the sender you removed actually gets an `Unauthorized user: <id>` line on their next message — that's ground truth, not the restart-requested log line.
+`env-sync push` does exactly this and then polls for proof, so you normally never do it by hand. Verify the same way it does: `cat /opt/data/gateway.pid` — **both** `pid` and `start_time` must differ from before — or `ps -o lstart -p <pid>`. Unchanged pid means no restart, no matter what any log line or exit code said. Where a behavioral check exists, prefer it as final ground truth (for an allowlist removal: an `Unauthorized user: <id>` line in `logs/gateway.log` on that sender's next message).
 
-### Access is the union of both stores — `.env` alone won't show you who's in
+Note that a Render redeploy or a save in the Environment tab restarts the whole container, which also picks up `.env` — but that's a much bigger hammer and still subject to the `.env`-wins precedence above.
 
-A user is authorized if they're in **either** `{PLATFORM}_ALLOWED_USERS` (env) **or** the pairing store (`line-approved.json`) — it's an OR, not one superseding the other. Concretely: Render's dashboard Shell/`.env` view only shows the env-var side. Someone can have working chat access purely via a redeemed invite code or an operator `pairing approve`, and never appear in `.env` at all. So "who currently has LINE access" always requires checking both `/opt/data/.env` (`LINE_ALLOWED_USERS`) *and* `/opt/data/platforms/pairing/line-approved.json` over SSH — never trust the dashboard's env view alone as the full picture. If `clients/<slug>.env` (see `admin-tools/env-sync`) has actually been kept in sync — i.e. every `push` since the last manual edit — it's a quick local check for the env-var side without SSHing in at all; the pairing-store side has no local mirror and always requires SSH regardless.
+## Platform access and pairing
 
-### Removing a user's access
+Separate from env vars: each chat platform has its own on-disk stores that gate who can talk to the agent. These live only on the instance's persistent disk, have no local mirror in this repo, and — unlike env vars — are **re-read from disk on every message**, so changes take effect immediately with no restart. Inspect them over SSH (see @SERVICES.md).
 
-Check both stores first (see above) to know which one(s) actually grant this user access, then remove from each accordingly:
+### LINE
 
-- **If they're in `line-approved.json` (pairing store):** run `hermes pairing revoke <user_id>` (or edit the JSON directly, same backup-then-edit-then-confirm-then-delete-backup discipline as any other manual edit to this file). Takes effect immediately, on their very next message — no restart needed, since `is_approved()` reads the file fresh every time.
-- **If they're in `LINE_ALLOWED_USERS` (env):** edit `clients/<slug>.env` to remove their ID, then run `hermes-env-sync push <slug>` (see `admin-tools/env-sync`) — it upserts `/opt/data/.env` and restarts-and-verifies the gateway in one step. Confirm the tool reports restart-verified, then confirm an `Unauthorized user: <id>` line for them in `logs/gateway.log` on their next message — that's ground truth, not the tool's own "verified" print. An edit alone does nothing until a real, verified restart happens — this is the exact failure mode this section exists to guard against.
-- If they're in **both**, do both steps — removing only one leaves them authorized via the other.
+Four mechanisms, three of them file-backed:
+
+| Mechanism | Where | Reload |
+| --- | --- | --- |
+| `LINE_ALLOWED_USERS`, `LINE_DM_POLICY`, `LINE_ALLOWED_GROUPS`, `LINE_REQUIRE_MENTION`, … | `/opt/data/.env` | env var — **needs a verified restart** |
+| Pairing approvals | `/opt/data/platforms/pairing/line-approved.json` (+ `line-pending.json`) | every message |
+| One-off QR join invites | `/opt/data/platforms/line-invites/invites.json` | every message |
+| Per-group response mode | `/opt/data/platforms/line-modes/modes.json` | every message |
+
+**DM access is the union of env + pairing store.** A user is authorized if they're in **either** `LINE_ALLOWED_USERS` **or** `line-approved.json` — an OR, not one superseding the other. Someone can have working access purely from a redeemed invite code or an operator `hermes pairing approve`, and never appear in `.env` at all. So "who currently has LINE access" always requires reading both, over SSH. Render's dashboard/`.env` view shows only the env half and is never the full picture. (`clients/<slug>.env` is a fine local shortcut for the env half *if* it's been kept in sync — every change pushed, no manual edits since; the pairing half always needs SSH.)
+
+**Pairing and invites** both flow through `PairingStore.is_approved()`. Under `dm_policy: pairing` (the default, from `patches/line-dm-pairing.patch`) an unrecognized DM falls through to the gateway's pairing logic and the sender gets a code for an operator to approve, rather than being dropped. `LineInviteStore` is deliberately a separate store: an invite token is minted ahead of time by the `line-invite` skill and grants access on redemption with no approval step. Because these re-read on every message, they're the right tool for a quick revoke/re-grant test loop.
+
+**Group response mode** (`modes.json`, written by `GroupModeStore` in `modules/line/render_mention.py`) sits on the no-restart side too: `get_mode()` re-reads on every group message so the in-chat toggle (the Template Buttons bubble, or `mode always` / `mode mention` addressed to the bot) applies on the very next message. `LINE_REQUIRE_MENTION` / `LINE_MENTION_FOLLOWUP_SECONDS` are env vars and follow the restart rules, but they only supply the default for a group the store has never seen — **a stored mode always wins**, so never reach for `env-sync push` to change one group's behavior. This is distinct from `LINE_ALLOWED_GROUPS`, which is an env var and controls whether the bot responds in that group *at all*.
+
+Treat all these JSON files as read-only unless the task calls for a change. If you must hand-edit one, back it up first, edit, confirm the new behavior, then delete the backup.
+
+### Removing a LINE user's access
+
+Check both DM stores first to know which one(s) actually grant access, then remove from each that does — removing from only one leaves them in via the other.
+
+- **In `line-approved.json`:** `hermes pairing revoke <user_id>`. Effective on their very next message, no restart.
+- **In `LINE_ALLOWED_USERS`:** remove their ID from `clients/<slug>.env`, run `hermes-env-sync push <slug>`, confirm it reports restart-verified, then confirm an `Unauthorized user: <id>` line for them in `logs/gateway.log` on their next message. The edit alone does nothing until a real, verified restart happens.
 
 ## Reusable patterns
 
