@@ -28,6 +28,7 @@ per ``CLAUDE.md``, anything cached at adapter construction needs a verified
 gateway restart to change, which is the wrong cost for a toggle people flip
 from inside a chat.
 """
+
 from __future__ import annotations
 
 import json
@@ -315,7 +316,9 @@ class GroupModeStore:
 
     def set_mode(self, chat_id: str, mode: str, set_by: str = "") -> None:
         if mode not in VALID_MODES:
-            raise ValueError(f"unknown mode {mode!r}; expected one of {sorted(VALID_MODES)}")
+            raise ValueError(
+                f"unknown mode {mode!r}; expected one of {sorted(VALID_MODES)}"
+            )
         with self._lock:
             data = self._load()
             data[chat_id] = {
@@ -388,7 +391,8 @@ def _followup_seconds_from_env() -> float:
     except ValueError:
         logger.warning(
             "LINE: ignoring invalid LINE_MENTION_FOLLOWUP_SECONDS=%r; using %s",
-            raw, DEFAULT_FOLLOWUP_SECONDS,
+            raw,
+            DEFAULT_FOLLOWUP_SECONDS,
         )
         return DEFAULT_FOLLOWUP_SECONDS
 
@@ -441,7 +445,9 @@ class MentionGate:
             command = parse_mode_command(stripped) if is_text else None
             if command is not None:
                 return GateDecision(allow=False, reason="mode-command", command=command)
-            return GateDecision(allow=True, reason="always-mode", stripped_text=stripped)
+            return GateDecision(
+                allow=True, reason="always-mode", stripped_text=stripped
+            )
 
         mentioned = is_self_mentioned(message)
         if mentioned:
@@ -494,7 +500,10 @@ class MentionGate:
             return False
         self.store.set_mode(chat_id, mode, user_id)
         logger.info(
-            "LINE: response mode for %s set to %r by %s (button)", chat_id, mode, user_id
+            "LINE: response mode for %s set to %r by %s (button)",
+            chat_id,
+            mode,
+            user_id,
         )
         await self._send_mode_card(client, chat_id, reply_token)
         return True
@@ -518,4 +527,6 @@ class MentionGate:
         except Exception as exc:
             # The mode change already landed on disk; failing to confirm it is
             # not a reason to raise into the adapter's event dispatch.
-            logger.warning("LINE: mode confirmation send failed for %s: %s", chat_id, exc)
+            logger.warning(
+                "LINE: mode confirmation send failed for %s: %s", chat_id, exc
+            )

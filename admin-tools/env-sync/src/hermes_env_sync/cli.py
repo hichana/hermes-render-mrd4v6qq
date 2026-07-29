@@ -7,6 +7,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from hermes_env_sync import auditlog
 from hermes_env_sync import diff as diff_render
 from hermes_env_sync import envfile
 from hermes_env_sync import registry as registry_mod
@@ -35,6 +36,25 @@ def cmd_diff(args: argparse.Namespace) -> int:
     _, _, diff = _compute_diff(transport, target)
     print(diff_render.render(diff))
     return 0
+
+
+def _record(slug: str, action: str, outcome: str, *, diff=None, gateway_pid=None) -> None:
+    """Append to the committed push log. Never fatal.
+
+    The remote write has already happened by the time this runs; failing to
+    write a local audit row is not a reason to report the push itself as
+    failed.
+    """
+    try:
+        auditlog.append_record(
+            auditlog.LOG_PATH,
+            auditlog.build_record(
+                slug=slug, action=action, outcome=outcome,
+                diff=diff, gateway_pid=gateway_pid,
+            ),
+        )
+    except OSError as exc:
+        print(f"warning: could not write {auditlog.LOG_PATH}: {exc}", file=sys.stderr)
 
 
 def _write_backup(slug: str, remote_text: str) -> Path:
@@ -73,6 +93,7 @@ def cmd_push(args: argparse.Namespace) -> int:
         transport.write_file_atomic(REMOTE_ENV_PATH, REMOTE_ENV_TMP_PATH, new_text)
     except SSHError as exc:
         print(f"error: remote write failed: {exc}", file=sys.stderr)
+        _record(args.slug, "push", "write-failed", diff=diff)
         return 1
     print("remote .env updated")
 
@@ -80,9 +101,12 @@ def cmd_push(args: argparse.Namespace) -> int:
         new_pid = restart_and_verify(transport)
     except RestartVerificationError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        _record(args.slug, "push", "restart-unverified", diff=diff)
         return 1
 
     print(f"restart verified (pid={new_pid.pid}, start_time={new_pid.start_time})")
+    _record(args.slug, "push", "ok", diff=diff, gateway_pid=new_pid)
+    print(f"recorded in {auditlog.LOG_PATH.name} — commit it")
     return 0
 
 
@@ -93,8 +117,11 @@ def cmd_restart_only(args: argparse.Namespace) -> int:
         new_pid = restart_and_verify(transport)
     except RestartVerificationError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        _record(args.slug, "restart-only", "restart-unverified")
         return 1
     print(f"restart verified (pid={new_pid.pid}, start_time={new_pid.start_time})")
+    _record(args.slug, "restart-only", "ok", gateway_pid=new_pid)
+    print(f"recorded in {auditlog.LOG_PATH.name} — commit it")
     return 0
 
 

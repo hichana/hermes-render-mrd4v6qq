@@ -124,6 +124,45 @@ uv run --project admin-tools/env-sync hermes-env-sync list
    Times out after 200s (comfortably past the 180s default
    `agent.restart_drain_timeout`) and reports failure clearly if
    verification doesn't succeed.
+7. Appends one row to `push-log.csv` (see below) and reminds you to commit
+   it.
+
+## `push-log.csv` — the committed record of remote writes
+
+A push changes a live client instance but otherwise leaves no trace in
+git: it reads from `clients/<slug>.env` (gitignored — real secrets),
+writes to a remote `/opt/data/.env` that's in no repo at all, and snapshots
+to `.backups/` (gitignored for the same reason). That means repo history
+has nothing to say about when a client instance last changed or what
+changed on it — which is the first thing you want to know when something
+starts misbehaving in production.
+
+`push-log.csv` closes that gap. It is **committed on purpose**, one row per
+remote-affecting run:
+
+```
+timestamp_utc,operator,slug,action,outcome,keys_added,keys_changed,keys_removed,gateway_pid,gateway_start_time
+```
+
+- **Key names only, never values.** `auditlog.build_record` reads names off
+  the `Diff` and has no access to the right-hand side of any `KEY=value`
+  line, so a secret can't reach this file by construction rather than by
+  someone remembering not to log it. `tests/test_auditlog.py` asserts a
+  known secret value never appears in a built row.
+- **Failures are recorded too.** `outcome` is `ok`, `write-failed`, or
+  `restart-unverified`. That middle state — remote `.env` written, restart
+  *not* verified — is exactly the one worth a permanent record, since the
+  instance is then running config that doesn't match what's on its disk.
+- **Writing the row is never fatal.** By the time it runs, the remote write
+  already happened; a local `OSError` prints a warning and nothing more.
+- Commit it alongside whatever prompted the push. `git log -p --
+  admin-tools/env-sync/push-log.csv` then reads as the deployment history
+  for every client instance.
+
+The first row is a backfill of the 2026-07-28 `LINE_ALLOWED_GROUPS` push
+(reconstructed from the `.backups/` snapshot that immediately preceded it),
+written by hand before this logging existed — `gateway_start_time` is blank
+there because it wasn't recorded at the time.
 
 ## Testing
 
