@@ -166,6 +166,25 @@ failure" email — not a crash, just a race at boot.
 - Add a smoke-test assertion (Pattern 4) that checks for zero 502s
   during a fresh `docker run` boot cycle, to catch a regression here.
 
+## 6. `line failed to connect` warning at boot
+
+**Symptom:** one `WARNING gateway.run: ✗ line failed to connect` at
+`03:20:26`, exactly at that deploy's `finishedAt` timestamp.
+
+**Why this happens:** a boot-sequence transient — the LINE adapter
+connecting before some dependency was ready — not an ongoing failure.
+Webhook traffic succeeded normally afterward. Same family as #5: things
+starting in parallel and one briefly losing the race.
+
+**Initial fix idea:** the warning itself may be unavoidable without
+upstream ordering changes, so the priority is making it *distinguishable*
+rather than silencing it. Add one assertion to the boot smoke test
+(Pattern 4 in ARCHITECTURE.md) that this warning appears at most once and
+only within the boot window — so a *persistent* version doesn't get waved
+off as "the same harmless boot blip" the next time someone reads the logs.
+If #5's readiness-gating work lands, re-check whether this disappears
+along with it.
+
 ## Suggested order
 
 1. #4 (dashboard auth) — already has a plan, is a real bug, easy to pick
@@ -178,3 +197,6 @@ failure" email — not a crash, just a race at boot.
    first; scope unclear until then.
 5. #1 (capability probe spam) — likely upstream-owned; lowest priority
    unless a Hermes config knob turns out to already exist.
+
+#6 isn't in this order — it's a one-line smoke-test assertion, so fold it
+into whichever pass touches the smoke test (most likely #5's).

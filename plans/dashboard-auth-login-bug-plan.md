@@ -1,13 +1,3 @@
-- One `WARNING gateway.run: ✗ line failed to connect` appeared at
-  `03:20:26`, exactly at that deploy's `finishedAt` timestamp — a
-  boot-sequence transient (LINE adapter connecting before some
-  dependency was ready), not an ongoing failure; webhook traffic
-  succeeded normally afterward. Worth one line in the smoke test (Phase
-  8) so a *persistent* version of this warning doesn't get waved off as
-  "the same harmless boot blip" the next time someone reads the logs.
-
-
-
 # Dashboard Auth Login Bug — Investigation Plan
 
 Goal: root-cause a live traceback in the Hermes dashboard's login flow,
