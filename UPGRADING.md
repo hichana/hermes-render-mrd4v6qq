@@ -137,7 +137,7 @@ SSH in per `SERVICES.md` (`ssh srv-…@ssh.oregon.render.com`).
    hermes doctor
    ```
 
-   Known cruft on our instance: a stale `mcp_servers.render` entry left from the Render-tooling strip (`plans/clean-boot-logs-plan.md` §3).
+   Formerly known cruft on our instance — a stale `mcp_servers.render` entry left from the Render-tooling strip — was **removed on 2026-07-30** and is now asserted against on fresh boot by `scripts/smoke-test.sh`. Don't expect it; if it reappears, something in the boot path regressed.
    Note that `scripts/patch-config.py` is insert-only by design and will never clean any of this up — removals are a deliberate manual edit.
 
 3. **Changed defaults from Phase 1.** For each `CONFIG DEFAULT` line the preflight printed, confirm the key is written *explicitly* in `/opt/data/config.yaml` rather than inherited:

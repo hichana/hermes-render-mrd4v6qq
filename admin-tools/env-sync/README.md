@@ -127,6 +127,42 @@ uv run --project admin-tools/env-sync hermes-env-sync list
 7. Appends one row to `push-log.csv` (see below) and reminds you to commit
    it.
 
+## `diff` is one-directional — it cannot show you untracked remote keys
+
+Worth internalizing before you trust a clean `diff`: the upsert is
+deliberately one-way, so **`diff` only ever reports on keys present in
+`clients/<slug>.env`.** A key that exists in the remote `/opt/data/.env` and
+*not* in your local file is left untouched by design (step 2 above) and is
+therefore invisible — `diff` prints `(no changes)` whether the remote has the
+same 12 keys as you or those 12 plus 13 more.
+
+That is the right *write* semantic (it's what stops this tool from clobbering
+anything set through Hermes' own dashboard), but it means a clean `diff` proves
+"nothing I track has drifted," never "the file matches." Those differ.
+
+**Found in practice, 2026-07-30.** `clients/ngraph-main.env` had 12 keys and
+`diff` was clean; the container had 25. Eleven of the extras were upstream tool
+defaults Hermes writes itself (`BROWSERBASE_*`, `BROWSER_*`, `*_TOOLS_DEBUG`,
+`TERMINAL_*`) and correctly none of our business. The other two were
+`TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USERS` — a live bot credential and
+its user allowlist, for a platform showing `connected`, existing **only** on the
+Render volume. Untracked, unbacked-up, and unrecoverable had that disk been
+lost. Both keys are listed in `client.env.example`, so this was an oversight
+rather than a decision. They have since been recovered into the local file.
+
+To audit the other direction, compare key *sets* (names are not secrets):
+
+```sh
+ssh <target> 'grep -oE "^[A-Za-z_][A-Za-z0-9_]*=" /opt/data/.env | tr -d "=" | sort' > /tmp/remote_keys
+grep -oE "^!?[A-Za-z_][A-Za-z0-9_]*=" clients/<slug>.env | tr -d "=" | sort > /tmp/local_keys
+comm -23 /tmp/remote_keys /tmp/local_keys   # in the container, untracked here
+```
+
+Then judge each result: business config or secrets belong in
+`clients/<slug>.env`; Hermes' own tool defaults should stay remote-only. Worth
+running after any bump, and any time you inherit an instance you didn't
+provision.
+
 ## `push-log.csv` — the committed record of remote writes
 
 A push changes a live client instance but otherwise leaves no trace in

@@ -156,6 +156,23 @@ the line-invite skill will not be discoverable. Check the 03-render-tools cont-i
 and patch-config.py's shebang/PyYAML assumptions."
 echo "  ok: skills.external_dirs patched into config.yaml"
 
+# 8b. The inverse of the above: the boot path must add skills.external_dirs and
+#     NOTHING else. Specifically, no Render MCP server. A client-facing agent
+#     with an `mcp_servers.render` entry can drive the Render account that hosts
+#     it (plans/done/strip-render-tooling-plan.md) — the exact inversion of repo
+#     CLAUDE.md's "only admins provision or manage Render resources."
+#     The repo-side tooling was stripped, but a stale entry survived on the live
+#     instance's volume for weeks afterwards (found 2026-07-30 during the
+#     v2026.7.20 bump; `RENDER_MCP_API_KEY` was unset, so it was inert rather
+#     than exploitable). /opt/data persists across deploys and this image is the
+#     template for every future client, so assert the fresh-boot case is clean.
+if docker exec "${CONTAINER}" grep -qE "mcp\.render\.com|RENDER_MCP_API_KEY" /opt/data/config.yaml; then
+  fail "a Render MCP entry is present in a freshly booted /opt/data/config.yaml — \
+something in the boot path is registering Render account access on a client-facing agent. \
+Find and remove it; see plans/done/strip-render-tooling-plan.md."
+fi
+echo "  ok: no Render MCP entry in config.yaml"
+
 # 9. The line-invite skill's script can actually import what it needs.
 #    LineInviteStore exists ONLY because of line-dm-pairing.patch, and
 #    `qrcode` only because upstream happens to ship it — an upgrade can drop

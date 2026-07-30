@@ -104,19 +104,41 @@ this *already-running* instance (config removal doesn't retroactively
 edit a live instance's config — only fresh boots get the current
 patcher output).
 
-**Initial fix idea:**
-- Check this instance's `/opt/data/config.yaml` (or wherever
-  `mcp_servers`/`render` is registered) over SSH for a leftover `render`
-  MCP entry. If found, this is old state from before the Render-tooling
-  removal and should be removed (with the same backup-then-edit
-  discipline as other manual `/opt/data` edits).
-- Confirm the *current* boot patcher (`scripts/patch-config.py` /
-  `03-render-tools` hook) no longer inserts a `render` MCP entry on new
-  boots — it shouldn't, per the strip, so this should only affect
-  instances provisioned before that change.
-- Add this as a smoke-test assertion (Pattern 4 in CLAUDE.md): grep a
-  fresh boot's `config.yaml` for absence of a `render` MCP entry, so a
-  regression here is caught before shipping.
+**RESOLVED 2026-07-30.** All three steps done:
+
+- [x] Removed the leftover entry from the live instance's
+  `/opt/data/config.yaml` over SSH, backup-then-edit
+  (`config.yaml.bak-mcpstrip-20260730-064338`). The block was exactly the
+  pre-strip shape:
+
+  ```yaml
+  mcp_servers:
+    render:
+      url: https://mcp.render.com/mcp
+      headers:
+        Authorization: Bearer ${RENDER_MCP_API_KEY}
+  ```
+
+  `mcp_servers` had no other entries, so the whole top-level key went.
+  Confirmed after: YAML parses, 13 top-level keys, `session_reset` and
+  `skills.external_dirs` intact, gateway restarted and verified, both LINE
+  and Telegram reconnected, `hermes doctor` clean.
+- [x] Confirmed `scripts/patch-config.py` only ever inserts
+  `skills.external_dirs` — it has no MCP code path at all, so this was
+  genuinely orphaned volume state and cannot come back on its own.
+- [x] Added the smoke-test assertion (8b in `scripts/smoke-test.sh`), and
+  negative-tested the regex against the removed block so it isn't vacuous.
+
+**Severity note, for the record.** `RENDER_MCP_API_KEY` was never set in
+`/opt/data/.env`, so the entry was inert — it produced the keepalive log noise
+above and nothing worse. Had that key been present, a client-facing agent would
+have held credentials to the Render account hosting it, which inverts repo
+CLAUDE.md's "only admins provision or manage Render resources." **The two
+halves of that risk decayed separately: the repo-side strip removed the key
+while the volume kept the entry.** Config removed from the image is not config
+removed from a running instance — `/opt/data` survives every deploy, so any
+strip needs a volume sweep on already-provisioned instances, not just a code
+change.
 
 ## 4. Dashboard `NotImplementedError` on `/auth/login` — already tracked
 

@@ -66,6 +66,25 @@ key — which is the general lesson: **a default we inherit is a setting upstrea
 controls.** When a `CONFIG DEFAULT` line in the preflight names a key we care
 about, pin it rather than re-deciding it every bump.
 
+## Follow-on work done the same day (2026-07-30)
+
+Both prompted by findings above rather than by the bump itself.
+
+**Render MCP cruft removed.** `plans/clean-boot-logs-plan.md` §3 is now
+resolved — entry removed from the volume, patcher confirmed innocent, and
+smoke-test assertion 8b added so a fresh boot can never ship it. The
+transferable lesson is there, not here: config removed from the image is not
+config removed from a running instance, because `/opt/data` survives deploys.
+
+**`clients/ngraph-main.env` audited against the container.** `diff` was clean
+but the file tracked 12 of the container's 25 keys, and two of the untracked
+ones were `TELEGRAM_BOT_TOKEN` + `TELEGRAM_ALLOWED_USERS` — a live credential
+and allowlist that existed only on the Render volume. Recovered into the local
+file, verified byte-identical (`diff` still clean afterwards). The reason a
+clean `diff` didn't catch it is structural and now documented in
+`admin-tools/env-sync/README.md`: the upsert is one-way, so `diff` reports only
+on keys you already track.
+
 ## Outstanding
 
 - **Phase 4 step 5, negative half:** confirm a group message *without* an
