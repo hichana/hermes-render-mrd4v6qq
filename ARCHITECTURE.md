@@ -71,7 +71,7 @@ Platform adapters (LINE, Discord, Slack, etc.) ship in the upstream `nousresearc
 - **`modules/line/render_mention.py`** — The logic for mention gating, copied directly into the upstream plugin as a new sibling module. Kept separate from patches so it's unit-testable without cloning upstream (`tests/test_render_mention.py`).
 - **Skills** (e.g., `skills/line-invite/`) — New skills baked into the image and registered at boot via `scripts/patch-config.py` (Pattern 1) and a cont-init hook (Pattern 2), without patching.
 
-See `patches/README.md` for regeneration instructions when bumping `HERMES_IMAGE`.
+See `UPGRADING.md` for the full bump procedure, and `patches/README.md` for patch regeneration once a bump is confirmed to need it.
 
 ## How env vars work here
 
@@ -165,7 +165,7 @@ We built and then deliberately removed a Render-specific MCP integration. The in
 **Shape of the solution** (was `scripts/bootstrap.sh`, `git show 3eb2be3:scripts/bootstrap.sh`, installed by the `Dockerfile` at `git show 3eb2be3:Dockerfile`):
 - Installed as `/etc/cont-init.d/NN-<name>` (s6-overlay convention — hooks run in lexical order). Upstream Hermes ships hooks numbered `01`, `015`, `02`; pick a number that lands after whatever your hook depends on (we used `03`, after the volume was chowned and seeded).
 - Shebang is `#!/command/with-contenv sh`, **not** plain `#!/bin/sh`, if the hook (or anything it execs, e.g. via `s6-setuidgid`) needs to read a Render/docker `-e` env var. s6-overlay v3 cont-init scripts don't get the container environment for free — it's captured into `/run/s6/container_environment/` files at container start, but only `with-contenv` actually exports those into a script's process env. A real incident: `scripts/seed-env-from-render.py` (Pattern 1 applied to `.env`) silently saw an empty value for the var it was supposed to seed, because `bootstrap.sh` used plain `#!/bin/sh` — `docker exec -u hermes <script>` found the var fine (exec goes through a different path), which is what made it look like a script bug at first rather than a shebang/environment-propagation one. Plain `#!/bin/sh` is still correct for hooks that only touch `config.yaml`/static paths and never read a caller-supplied env var.
-- `set -eu`, run as root (cont-init always does), and privilege-drop into `hermes` for anything that touches `/opt/data` via `s6-setuidgid` — **not** `gosu`, which isn't present in this s6-based image (a real incident: see `README.md`'s "Service won't start" table history for the v2026.5.7 → v2026.7.7.2 upgrade).
+- `set -eu`, run as root (cont-init always does), and privilege-drop into `hermes` for anything that touches `/opt/data` via `s6-setuidgid` — **not** `gosu`, which isn't present in this s6-based image (a real incident from the v2026.5.7 → v2026.7.7.2 upgrade; see `UPGRADING.md`).
 - Never `exec`s anything — a hook that execs pre-empts s6 from starting the rest of the supervised services.
 - Failures inside the hook are logged and swallowed, not fatal — same reasoning as the patcher itself: this is additive functionality, and its absence should degrade gracefully, not take down the agent.
 
@@ -185,11 +185,69 @@ We built and then deliberately removed a Render-specific MCP integration. The in
 
 ### Dockerfile / render.yaml conventions worth keeping
 
-- Pin external things by commit/tag via `ARG`, with the pin and the "how to upgrade" instructions living next to each other in a header comment (see current `Dockerfile` header, and the "Updating" section of `README.md`).
+- Pin external things by commit/tag via `ARG`, with the pin and a pointer to the upgrade procedure living next to each other in a header comment (see the current `Dockerfile` header, and `UPGRADING.md`).
 - Anything that must never sync from a Blueprint (secrets, per-service values) goes in `render.yaml` as `sync: false`, with a comment explaining why it's sensitive and where to generate it.
 - Don't override the image's `ENTRYPOINT`. Put boot-time work in `/etc/cont-init.d/` hooks instead (see Pattern 2) — the `Dockerfile`'s closing comment block explains exactly why this matters and what broke when it wasn't followed.
 
 ## Validation
 
-- `./scripts/smoke-test.sh` — builds and boots the image the way Render does, then asserts it stays up, the gateway reaches `running`, and (currently) Caddy routes and the dashboard auth gate is armed. Extend this file's assertions rather than adding a separate test runner for anything that only matters at boot.
-- `tests/` doesn't currently exist (it held one file, testing Pattern 1's patcher, and was removed along with it) — recreate it for anything unit-testable without a running container. The removed test imported its module directly via `importlib` rather than a package import (`git show 3eb2be3:tests/test_patch_config.py`), which is a reasonable pattern for testing a standalone `scripts/*.py` file without needing it installed as a package.
+### What `scripts/smoke-test.sh` actually does
+
+In plain terms: it's a shell script that builds this repo's Docker image, starts a container from it on your laptop, then pokes at that running container from the outside and checks the answers. If every check passes it prints `PASS`; the first one that fails prints `FAIL: <reason>` and stops. Nothing is mocked — every assertion runs against a real, booted container.
+
+The moving parts:
+
+1. **`docker build`** — produces the image from the `Dockerfile`. This step alone catches a whole class of upgrade failure for free: `git apply` has no fallback flags, so if a patch doesn't apply to the pinned base image, the build aborts here and loudly.
+2. **`docker run`** with flags that deliberately mimic Render rather than stock Docker — `--security-opt no-new-privileges`, `--cap-drop NET_BIND_SERVICE`, dashboard on `10001` bound `0.0.0.0`. Render's runtime is stricter than a local `docker run`, and that gap has already hidden a production-only failure from us (the Caddy binary's file capabilities). Testing under stock defaults would have passed while production died.
+3. **A boot wait loop** (90s ceiling) that polls `/api/status` *through Caddy on :10000*, so reaching `gateway_state: running` simultaneously proves the proxy's catch-all route works. It also bails early if the container has exited.
+4. **`docker exec`-based assertions** — the script runs commands *inside* the container (`curl`, `ps`, `grep`, `test -f`, and Python one-liners against Hermes' own venv) and checks their output or exit status. That's the whole trick: `docker exec` lets a plain shell script inspect live in-container state without SSH or a test framework.
+
+The nine checks, and the failure each exists to catch:
+
+| Check | Catches |
+| --- | --- |
+| Container still running | The entrypoint chain never reached our `CMD` (the v2026.5.7 → v2026.7.7.2 boot break) |
+| `gateway_state == running` via Caddy `:10000` | A wedged gateway, and a broken proxy catch-all route |
+| `caddy` installed and in the process table | The s6 service didn't register, or the binary can't exec under Render's restrictions |
+| `/api/keys` returns 401/403 | The dashboard auth gate isn't armed — would expose provider keys and a PTY to the internet |
+| `/line/webhook/health` returns 502/503, **not** a 30x | The `/line/*` route is falling through to the dashboard's login redirect instead of reaching the LINE adapter |
+| `render_mention.py` present **and** importable as `plugins.platforms.line.render_mention` | The `COPY` landed at the wrong path, or the file exists but isn't importable as part of the package (a property of the editable install, not of the file being on disk) |
+| `_mention_gate` in `adapter.py` **and** the patched adapter imports | `line-group-mention.patch` didn't apply, or applied and introduced an `ImportError` that would only surface as a dead LINE channel on a client instance |
+| `/opt/render-tools/skills-local` in `/opt/data/config.yaml` | The boot-time config patcher didn't run or didn't land — covers its shebang, PyYAML in Hermes' venv, and cont-init hook ordering all at once |
+| `LineInviteStore` + `qrcode` importable | Our patch didn't provide the class, or upstream dropped the `qrcode` dependency — otherwise discovered by a manager whose QR invite command fails |
+
+Why so much of it asserts *state* rather than reading logs is Pattern 4 above: a swallowed exception or a failed privilege drop will still print a success-shaped log line. Several of these checks are specifically designed to be things `docker logs` cannot tell you.
+
+Cost: about 33 seconds on a warm cache, plus a multi-GB base-image pull the first time a new tag is used. Requires Docker running locally.
+
+### The validation surface
+
+- `./scripts/smoke-test.sh` — builds and boots the image the way Render does, then asserts it stays up, the gateway reaches `running`, Caddy routes (including `/line/*` to the LINE backend), the dashboard auth gate is armed, the patched LINE adapter and mention-gate module import, `skills.external_dirs` landed in `config.yaml`, and the `line-invite` skill's dependencies resolve. Requires Docker. Extend this file's assertions rather than adding a separate test runner for anything that only matters at boot.
+- `./scripts/upgrade-preflight.sh <candidate-tag>` — read-only upstream drift check for a `HERMES_IMAGE` bump; no Docker, no clone, about a minute. Its `DEPS` / `SYMBOLS` / `STRUCTURE` tables are the maintained inventory of everything in this repo that reaches into upstream internals. See `UPGRADING.md`.
+- `python3 -m pytest tests/ -q` — unit tests that need neither a container nor an upstream clone:
+  - `tests/test_render_mention.py` — the mention gate.
+  - `tests/test_upgrade_preflight.py` — the preflight script, driven end to end against a `file://` fixture tree via `PREFLIGHT_RAW_BASE`. The fixture is derived from the live `DEPS` table rather than restated, so adding a manifest entry can't break unrelated tests.
+  - `tests/test_preflight_manifest_coverage.py` — guards the preflight's own blind spot (below).
+
+  All three load their subject directly rather than as an installed package — the right pattern for testing a standalone `modules/*.py` or `scripts/*` file.
+
+### Keeping the preflight manifest honest
+
+`scripts/upgrade-preflight.sh` is a **closed-world** check: it verifies what its manifest lists and is blind to everything else. So its worst failure mode isn't a false alarm, it's a confident all-clear for a dependency nobody registered.
+
+`tests/test_preflight_manifest_coverage.py` closes the mechanically-detectable half of that. It derives what the manifest *should* contain from places the repo already declares its upstream touchpoints, and fails if the manifest has fallen behind:
+
+| Rule | Derived from | Catches |
+| --- | --- | --- |
+| Patch targets are `blocker` entries | `+++ b/<path>` headers in `patches/*.patch`, cross-referenced against the `Dockerfile`'s `git apply` step | A new patch, or a new file in an existing patch, that drift-checking would skip |
+| Non-applied patch targets are at least tracked | same, for patches the `Dockerfile` doesn't apply | `line-dm-pairing.tests.patch`'s target drifting unnoticed until mid-regeneration |
+| `COPY` destinations are covered | `COPY ... /opt/hermes/...` lines | Upstream moving a package we write a module into |
+| Imported modules are in `DEPS` | `from <upstream-module> import ...` in `modules/`, `skills/`, `scripts/`, and patches' added lines | Depending on a new upstream module without registering it |
+| Imported symbols are in `SYMBOLS` | same | Upstream renaming something we import by name |
+| Every `SYMBOLS` path is a `DEPS` path | the manifest itself | A latent trap: the script only fetches `DEPS` files and its symbol loop skips anything absent, so an orphaned `SYMBOLS` entry silently never runs while still being counted in the reassuring "all N tracked symbols still present" line |
+
+Symbols our own patches introduce (e.g. `LineInviteStore`) and modules we `COPY` in (e.g. `render_mention`) are excluded automatically — asking upstream to provide them would fail on every tag forever.
+
+Verified by mutation: dropping a `DEPS` entry, downgrading a patch target's severity, dropping a `SYMBOLS` entry, and orphaning one each turn the suite red.
+
+**What no test can catch:** a new upstream *mechanism* we haven't started depending on yet — a new config layout, a new plugin discovery path. The manifest handles regression; reading the release notes (`UPGRADING.md` Phase 0) handles novelty. Neither substitutes for the other. Also uncovered: dependencies expressed only as runtime paths in shell (`/opt/hermes/.venv/bin/python` shebangs, `/opt/hermes/ui-tui`) — those are asserted by the preflight's `STRUCTURE` table and the smoke test, not by coverage.

@@ -65,9 +65,20 @@ the real import before any deploy.
 against another.** `git apply` matches on context lines, not just line
 numbers — if upstream touched the same file, the old patch can fail
 loudly (it does not silently mis-apply) with a "patch does not apply"
-error at `docker build` time. Whenever you bump the `ARG HERMES_IMAGE` tag
-in the `Dockerfile`, regenerate every patch in this directory against the
-new tag before deploying:
+error at `docker build` time.
+
+**First, find out whether you need to.** `./scripts/upgrade-preflight.sh
+<new-tag>` (see `UPGRADING.md` Phase 1) diffs the two files these patches
+touch between the pinned tag and the candidate, in about a minute, without a
+clone or a `docker pull`. It replaces steps 1-2 below for the common case: if
+it reports `plugins/platforms/line/adapter.py` and `plugin.yaml` unchanged,
+the existing patches apply as-is and there is nothing to regenerate. If it
+reports drift, confirm with the `git apply -p1 --check` one-liner in step 5
+before assuming the worst — `git apply` matches context and tolerates line
+offsets, so upstream can touch a file without breaking our hunks.
+
+Only when that check actually fails, regenerate every patch in this
+directory against the new tag before deploying:
 
 ```bash
 # 1. Clone the exact new tag (shallow, fast) — do NOT edit the running

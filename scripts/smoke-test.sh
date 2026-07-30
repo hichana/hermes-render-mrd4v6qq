@@ -142,10 +142,38 @@ docker exec "${CONTAINER}" /opt/hermes/.venv/bin/python3 -c \
   || fail "the patched LINE adapter does not import — the mention-gate call-outs are broken"
 echo "  ok: mention-gate call-outs present, patched adapter imports"
 
+# 8. The boot-time config patcher actually ran and landed. Asserting the live
+#    file rather than a log line (ARCHITECTURE.md's Pattern 4) covers three
+#    independent upgrade-fragile assumptions at once: patch-config.py's
+#    `#!/opt/hermes/.venv/bin/python` shebang still resolves, PyYAML still
+#    ships in Hermes' venv, and /etc/cont-init.d/03-render-tools still sorts
+#    after upstream's 01/015/02 hooks. All three are invisible in `docker
+#    logs` — the hook swallows its own failures on purpose so a bad patcher
+#    can never keep the agent from booting.
+docker exec "${CONTAINER}" grep -q "/opt/render-tools/skills-local" /opt/data/config.yaml \
+  || fail "skills.external_dirs was not patched into /opt/data/config.yaml — \
+the line-invite skill will not be discoverable. Check the 03-render-tools cont-init hook \
+and patch-config.py's shebang/PyYAML assumptions."
+echo "  ok: skills.external_dirs patched into config.yaml"
+
+# 9. The line-invite skill's script can actually import what it needs.
+#    LineInviteStore exists ONLY because of line-dm-pairing.patch, and
+#    `qrcode` only because upstream happens to ship it — an upgrade can drop
+#    that dependency, and without this check we'd first hear about it from a
+#    client's manager whose QR invite command failed.
+docker exec "${CONTAINER}" /opt/hermes/.venv/bin/python3 -c \
+  "import sys; sys.path.insert(0, '/opt/hermes'); \
+from plugins.platforms.line.adapter import LineInviteStore; import qrcode" \
+  >/dev/null 2>&1 \
+  || fail "the line-invite skill cannot import its dependencies — either \
+LineInviteStore is missing (line-dm-pairing.patch did not apply) or qrcode is no longer \
+in Hermes' venv. See skills/line-invite/scripts/generate_invite.py."
+echo "  ok: line-invite skill dependencies importable"
+
 # Note: there used to be a 6th check here confirming a boot-time seeder
 # copied a Render env var into /opt/data/.env. That mechanism (insert-only,
 # went silently stale on any later edit) was replaced by admin-tools/env-sync,
 # which upserts a live, provisioned Render instance over real SSH — out of
 # scope for this local Docker boot smoke test.
 
-echo "PASS: image boots, gateway running, Caddy routing, auth armed"
+echo "PASS: image boots, gateway running, Caddy routing, auth armed, LINE patches live, boot config patched"

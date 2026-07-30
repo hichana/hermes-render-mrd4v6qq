@@ -16,11 +16,11 @@
 # port 10000; persistent state lives on a 5 GB disk mounted at /opt/data
 # (HERMES_HOME default).
 #
-# To upgrade Hermes: bump HERMES_IMAGE in the Dockerfile, run
-# ./scripts/smoke-test.sh, then redeploy. Do not skip the smoke test —
-# the v2026.5.7 -> v2026.7.7.2 bump silently broke the container's boot
-# (upstream moved to s6-overlay) and the service ran wedged for 8 days
-# while still looking healthy.
+# To upgrade Hermes, follow UPGRADING.md — do not just bump HERMES_IMAGE
+# and redeploy. The v2026.5.7 -> v2026.7.7.2 bump was exactly that, and it
+# silently broke the container's boot (upstream moved to s6-overlay); the
+# service ran wedged for 8 days while still looking healthy, because the
+# healthCheckPath below is served by the dashboard, not the gateway.
 
 services:
   - type: web

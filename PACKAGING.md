@@ -26,7 +26,7 @@ These must never appear in a `COPY` line, and exist only for people working in t
 |---|---|
 | `CLAUDE.md` | Internal instructions, company/personnel names (NGraph, Singo Takahashi, Matt Chana), SSH debugging procedures, incident history |
 | `SERVICES.md` | Per-client Render service IDs — a mapping that only makes sense to an admin holding account access |
-| `README.md` | Admin-facing setup/upgrade instructions; not something a client needs inside their own container |
+| `UPGRADING.md`, `ARCHITECTURE.md`, `HISTORICAL-GOTCHAS.md` | Admin-facing upgrade/architecture procedures and incident history; not something a client needs inside their own container |
 | `PACKAGING.md` (this file) | Meta-documentation about the packaging process itself |
 | `plans/`, `whiteboards/` | Working notes / design scratch space |
 | `.git/` | Full commit history, including anything ever committed and later removed |
@@ -59,7 +59,7 @@ container it manages. See `admin-tools/env-sync/README.md`.
 | `scripts/bootstrap.sh` | cont-init hook wiring (Pattern 2) — installed as `/etc/cont-init.d/03-render-tools` |
 | `caddy/` | Reverse proxy config and s6 service definition |
 
-`scripts/smoke-test.sh` is **not** packaged — it drives the image from the outside (`docker build` / `docker run`), it doesn't need to run inside it.
+`scripts/smoke-test.sh` and `scripts/upgrade-preflight.sh` are **not** packaged — the first drives the image from the outside (`docker build` / `docker run`), the second never touches an image at all. Neither needs to run inside one.
 
 ## Defense-in-depth: `.dockerignore`
 
@@ -70,7 +70,7 @@ Even though nothing today relies on it, a `.dockerignore` should exist so that a
 Per Pattern 4 in `CLAUDE.md` ("assert real state, not log lines"), `scripts/smoke-test.sh` should check the built image directly for the files that must never be present, e.g.:
 
 ```sh
-for f in CLAUDE.md SERVICES.md README.md PACKAGING.md render.yaml; do
+for f in CLAUDE.md SERVICES.md UPGRADING.md PACKAGING.md render.yaml; do
   docker exec "${CONTAINER}" sh -c "[ ! -e /$f ] && [ ! -e /opt/hermes/$f ]" \
     || fail "${f} was found in the built image — packaging boundary broken"
 done

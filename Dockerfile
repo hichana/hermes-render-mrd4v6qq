@@ -14,7 +14,9 @@
 # an admin-only action taken outside the deployed agent, via the Render
 # dashboard or CLI directly.
 #
-# Pin the upstream tag here. Bump and redeploy to upgrade Hermes.
+# Pin the upstream tag here. Bumping it is NOT a one-line change: follow
+# UPGRADING.md, starting with `./scripts/upgrade-preflight.sh <new-tag>`.
+# The last bump was done as a bare tag edit and ran wedged for 8 days.
 ARG HERMES_IMAGE=docker.io/nousresearch/hermes-agent:v2026.7.7.2
 ARG CADDY_IMAGE=docker.io/library/caddy:2.10-alpine
 FROM ${CADDY_IMAGE} AS caddy
