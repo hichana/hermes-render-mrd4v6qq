@@ -51,7 +51,29 @@ def render(diff: Diff) -> str:
             lines.append(f"  + {key}: {_value_of(new_raw)!r} (new)")
     for key in diff.removed:
         lines.append(f"  - {key} (removed)")
-    if not lines:
-        return "(no changes)"
-    lines.append(f"  ({diff.unchanged_count} other key(s) unchanged)")
+    if lines:
+        lines.append(f"  ({diff.unchanged_count} other key(s) unchanged)")
+    else:
+        lines.append("(no changes)")
+    lines.extend(_untracked_section(diff.untracked))
     return "\n".join(lines)
+
+
+def _untracked_section(untracked: list[str]) -> list[str]:
+    """Remote keys the local file doesn't track. Names only, never values.
+
+    This is the read-side counterpart to the upsert's write contract: nothing
+    here will be touched by a push. It's printed anyway because "(no changes)"
+    is otherwise indistinguishable between a local file that tracks every key
+    that matters and one missing a live credential. Judge each name: business
+    config or secrets belong in the local client file; Hermes' own tool knobs
+    (BROWSERBASE_*, TERMINAL_*, *_TOOLS_DEBUG, ...) are meant to stay remote.
+    """
+    if not untracked:
+        return []
+    return [
+        "",
+        f"  {len(untracked)} key(s) in the remote .env are not tracked locally",
+        "  (informational — a push will not touch these):",
+        *(f"    ? {key}" for key in untracked),
+    ]

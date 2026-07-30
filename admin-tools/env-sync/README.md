@@ -137,8 +137,27 @@ therefore invisible — `diff` prints `(no changes)` whether the remote has the
 same 12 keys as you or those 12 plus 13 more.
 
 That is the right *write* semantic (it's what stops this tool from clobbering
-anything set through Hermes' own dashboard), but it means a clean `diff` proves
+anything set through Hermes' own dashboard), but it means `no changes` proves
 "nothing I track has drifted," never "the file matches." Those differ.
+
+**So `diff` and `push` print the remote-only keys too**, after the change list:
+
+```
+(no changes)
+
+  11 key(s) in the remote .env are not tracked locally
+  (informational — a push will not touch these):
+    ? TERMINAL_MODAL_IMAGE
+    ? BROWSERBASE_PROXIES
+    ...
+```
+
+Names only, never values — same rule as `push-log.csv`, and for the same
+reason. The list is deliberately **not** part of `has_changes`: leaving these
+keys alone is the upsert's contract, so `push` still reports `nothing to
+change` and writes nothing when the only findings are untracked keys. Judge
+each name: business config or secrets belong in `clients/<slug>.env`; Hermes'
+own tool knobs should stay remote-only.
 
 **Found in practice, 2026-07-30.** `clients/ngraph-main.env` had 12 keys and
 `diff` was clean; the container had 25. Eleven of the extras were upstream tool
@@ -150,18 +169,8 @@ Render volume. Untracked, unbacked-up, and unrecoverable had that disk been
 lost. Both keys are listed in `client.env.example`, so this was an oversight
 rather than a decision. They have since been recovered into the local file.
 
-To audit the other direction, compare key *sets* (names are not secrets):
-
-```sh
-ssh <target> 'grep -oE "^[A-Za-z_][A-Za-z0-9_]*=" /opt/data/.env | tr -d "=" | sort' > /tmp/remote_keys
-grep -oE "^!?[A-Za-z_][A-Za-z0-9_]*=" clients/<slug>.env | tr -d "=" | sort > /tmp/local_keys
-comm -23 /tmp/remote_keys /tmp/local_keys   # in the container, untracked here
-```
-
-Then judge each result: business config or secrets belong in
-`clients/<slug>.env`; Hermes' own tool defaults should stay remote-only. Worth
-running after any bump, and any time you inherit an instance you didn't
-provision.
+Worth actually reading that section after any bump, and any time you inherit an
+instance you didn't provision.
 
 ## `push-log.csv` — the committed record of remote writes
 

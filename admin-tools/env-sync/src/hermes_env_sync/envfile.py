@@ -49,6 +49,14 @@ class Diff:
     changed: list[tuple[str, str, str]] = field(default_factory=list)  # key, old_raw, new_raw
     added: list[tuple[str, str]] = field(default_factory=list)  # key, new_raw
     removed: list[str] = field(default_factory=list)  # key
+    # Remote keys the local file says nothing about — neither `KEY=` nor
+    # `!KEY`. Purely informational, and deliberately NOT part of has_changes:
+    # leaving them alone is the upsert's entire contract. They're surfaced
+    # because a one-way diff otherwise reports "(no changes)" whether the
+    # remote holds the same keys as you or those plus a dozen you've never
+    # tracked — which is how a live TELEGRAM_BOT_TOKEN went unrecorded for
+    # weeks (2026-07-30). Names only; this list never carries values.
+    untracked: list[str] = field(default_factory=list)  # key
     unchanged_count: int = 0
 
     @property
@@ -152,6 +160,12 @@ def upsert(remote_text: str, local_text: str) -> tuple[str, Diff, list[str]]:
                 diff.unchanged_count += 1
             out.append(new_text)
         else:
+            # Not set locally and not marked for deletion: the local file has
+            # no opinion on this key. Pass it through untouched, but record
+            # that we saw it. Tested against `local_kv` rather than the
+            # `remaining` dict, which has already been popped from by now.
+            if line.key not in local_kv:
+                diff.untracked.append(line.key)
             out.append(line.text)
 
     # Anything left in `remaining` was local-only — append in local-file order.

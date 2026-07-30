@@ -1,8 +1,7 @@
 # Hermes bump: `v2026.7.7.2` → `v2026.7.20`
 
-Status as of **2026-07-30**: **deployed and verified live** (`79ba3ad`).
-Followed `UPGRADING.md`. One verification step is left, and it needs a human in
-a LINE group — see "Outstanding" below.
+Status: **complete**. Deployed and fully verified live on **2026-07-30**
+(`79ba3ad`), following `UPGRADING.md`. Nothing outstanding.
 
 ## Where it stands
 
@@ -12,7 +11,7 @@ a LINE group — see "Outstanding" below.
 | 1 — preflight | done: `1 blockers, 6 to review` |
 | 2 — bump + build | done: patches apply unchanged, 99 unit tests, 9/9 smoke assertions |
 | 3 — deploy | done — deployed by Matt |
-| 4 — verify live instance | done except step 5's negative mention test |
+| 4 — verify live instance | done, all six steps |
 | 5 — close the loop | done |
 
 Live instance confirms `version 0.19.0`, `release_date 2026.7.20`,
@@ -37,8 +36,11 @@ Live instance confirms `version 0.19.0`, `release_date 2026.7.20`,
    ever had an explicit mode set, so groups follow the `LINE_REQUIRE_MENTION`
    default, which the patch documents as mention-required. The store is
    created on first write.
-5. **LINE round trip** — DM to an approved user replied; an @-mentioned group
-   message replied. The negative half is still outstanding (below).
+5. **LINE round trip — fully verified.** DM from an approved user replied; an
+   @-mentioned group message replied; an un-mentioned group message got **no**
+   reply. That last one is the only assertion that distinguishes "the mention
+   patch applied and imports" (which the smoke test proves) from "the mention
+   patch gates" — so it's the one to insist on next bump.
 6. **env-sync restart path proven** — `restart-only ngraph-main` reported
    `restart verified (pid=5214, start_time=988680740)`, i.e. both fields
    changed. `gateway/run.py`'s USR1 plumbing survived a 3359-line diff.
@@ -85,15 +87,18 @@ clean `diff` didn't catch it is structural and now documented in
 `admin-tools/env-sync/README.md`: the upsert is one-way, so `diff` reports only
 on keys you already track.
 
-## Outstanding
+## Closed out
 
-- **Phase 4 step 5, negative half:** confirm a group message *without* an
-  `@`-mention gets **no** reply in a mention-mode group. Must be attempted
-  more than `LINE_MENTION_FOLLOWUP_SECONDS` (default 90s) after the last
-  mention by that same user, or from a different user — otherwise the
-  follow-up window legitimately answers an unmentioned message and the test
-  proves nothing. This is the only assertion that distinguishes "the mention
-  patch applied and imports" from "the mention patch gates."
+- Both `/opt/data/config.yaml` backups taken during the day's edits were
+  diffed against the live file (showing only the two intended changes and
+  nothing else), then deleted — the back-up → edit → confirm → delete
+  discipline, completed rather than left half-done.
+- `hermes-env-sync diff`/`push` now print the untracked remote keys that hid
+  the Telegram drift, so that half of the invariant is enforced by the tool
+  instead of by someone remembering to run `comm`. Informational only:
+  `has_changes` deliberately excludes them, so push still writes nothing when
+  untracked keys are the only finding. 46 env-sync tests pass; verified
+  against the live instance, which lists exactly the 11 expected knobs.
 
 ## Two findings worth carrying forward
 

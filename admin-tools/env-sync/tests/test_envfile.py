@@ -105,3 +105,50 @@ def test_bang_marker_wins_over_a_set_for_same_key():
     assert diff.removed == ["FOO"]
     assert diff.changed == []
     assert any("FOO" in w for w in warnings)
+
+
+# --- untracked remote keys -------------------------------------------------
+#
+# The upsert is deliberately one-way, which makes a clean diff mean "nothing
+# I track drifted" rather than "the files match". Reporting remote-only keys
+# closes that read-side blind spot; it must not change any write behavior.
+# See admin-tools/env-sync/README.md and ARCHITECTURE.md.
+
+
+def test_remote_only_keys_are_reported_as_untracked():
+    remote = "FOO=old\nTELEGRAM_BOT_TOKEN=secret\nBROWSER_SESSION_TIMEOUT=60\n"
+    local = "FOO=old\n"
+    _, diff, _ = upsert(remote, local)
+    assert diff.untracked == ["TELEGRAM_BOT_TOKEN", "BROWSER_SESSION_TIMEOUT"]
+
+
+def test_untracked_keys_are_not_changes():
+    """The whole point: informational only. `push` must still say nothing to do."""
+    remote = "FOO=old\nREMOTE_ONLY=x\n"
+    local = "FOO=old\n"
+    new_text, diff, _ = upsert(remote, local)
+    assert diff.untracked == ["REMOTE_ONLY"]
+    assert diff.has_changes is False
+    assert new_text == remote  # byte-identical: nothing written
+
+
+def test_locally_set_keys_are_never_untracked():
+    remote = "FOO=old\nBAR=old\n"
+    local = "FOO=new\nBAR=old\n"
+    _, diff, _ = upsert(remote, local)
+    assert diff.untracked == []
+
+
+def test_bang_marked_key_is_mentioned_locally_so_not_untracked():
+    remote = "FOO=old\nGONE=x\n"
+    local = "FOO=old\n!GONE\n"
+    _, diff, _ = upsert(remote, local)
+    assert diff.removed == ["GONE"]
+    assert diff.untracked == []
+
+
+def test_comments_and_blank_lines_are_not_untracked_keys():
+    remote = "# a comment\n\nFOO=old\n"
+    local = "FOO=old\n"
+    _, diff, _ = upsert(remote, local)
+    assert diff.untracked == []
