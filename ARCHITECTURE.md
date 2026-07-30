@@ -99,6 +99,7 @@ The sanctioned path for every ongoing change — rotating a key, onboarding LINE
 - It's a **targeted upsert**, not a file replacement: keys absent from your local file (e.g. anything set by hand through Hermes' dashboard) are left byte-for-byte untouched in place. That's why **deleting a line locally does not delete it remotely** — write a `!KEY_NAME` bang marker instead to actually remove a key.
 - `push` also backs up the pre-write remote `.env` to `.backups/`, restarts the gateway, verifies the restart really happened (below), and appends a row to `push-log.csv`. That CSV is **committed on purpose** — key names only, never values — and is the only record in git of when a live client instance last changed. Commit it alongside whatever prompted the push.
 - `diff <slug>` is read-only; `push --dry-run` previews; `restart-only <slug>` when `.env` is already right.
+- **A clean `diff` does not mean the two files match.** Because the upsert is one-way, `diff` only ever reports on keys present in `clients/<slug>.env` — a key that exists remotely and not locally is invisible to it. The intended relation is `local ⊆ remote`, never equality: Hermes writes its own tool knobs into `.env` (`BROWSERBASE_*`, `TERMINAL_*`, `*_TOOLS_DEBUG`, …), so the remote is always a superset. The invariant is therefore two-part — *every tracked key matches* (`diff` proves this) and *every remote-only key is justifiably not our business config* (`diff` cannot see this). Audit the second half by comparing key **sets**; the command and a worked example are in [`admin-tools/env-sync/README.md`](admin-tools/env-sync/README.md). Found this way on 2026-07-30: a live `TELEGRAM_BOT_TOKEN` and its allowlist existed only on the Render volume, untracked, while `diff` reported `(no changes)`.
 
 #### `LINE_BASIC_ID` — non-secret, still per-instance
 
@@ -131,7 +132,7 @@ Four mechanisms, three of them file-backed:
 | One-off QR join invites | `/opt/data/platforms/line-invites/invites.json` | every message |
 | Per-group response mode | `/opt/data/platforms/line-modes/modes.json` | every message |
 
-**DM access is the union of env + pairing store.** A user is authorized if they're in **either** `LINE_ALLOWED_USERS` **or** `line-approved.json` — an OR, not one superseding the other. Someone can have working access purely from a redeemed invite code or an operator `hermes pairing approve`, and never appear in `.env` at all. So "who currently has LINE access" always requires reading both, over SSH. Render's dashboard/`.env` view shows only the env half and is never the full picture. (`clients/<slug>.env` is a fine local shortcut for the env half *if* it's been kept in sync — every change pushed, no manual edits since; the pairing half always needs SSH.)
+**DM access is the union of env + pairing store.** A user is authorized if they're in **either** `LINE_ALLOWED_USERS` **or** `line-approved.json` — an OR, not one superseding the other. Someone can have working access purely from a redeemed invite code or an operator `hermes pairing approve`, and never appear in `.env` at all. So "who currently has LINE access" always requires reading both, over SSH. Render's dashboard/`.env` view shows only the env half and is never the full picture. (`clients/<slug>.env` is a fine local shortcut for the env half *only* if it's both fully pushed **and** known to track every relevant remote key — a clean `diff` proves the first, not the second, per the env-sync section above. The pairing half always needs SSH.)
 
 **Pairing and invites** both flow through `PairingStore.is_approved()`. Under `dm_policy: pairing` (the default, from `patches/line-dm-pairing.patch`) an unrecognized DM falls through to the gateway's pairing logic and the sender gets a code for an operator to approve, rather than being dropped. `LineInviteStore` is deliberately a separate store: an invite token is minted ahead of time by the `line-invite` skill and grants access on redemption with no approval step. Because these re-read on every message, they're the right tool for a quick revoke/re-grant test loop.
 
@@ -148,7 +149,9 @@ Check both DM stores first to know which one(s) actually grant access, then remo
 
 ## Reusable patterns
 
-We built and then deliberately removed a Render-specific MCP integration. The integration was Render-specific, but the *mechanisms* it used are generic and worth reusing the next time this repo needs to bake in a new capability and wire it up at boot. Rather than leave that code sitting around unused as a template, it's captured here — pull the actual implementation from git history (`git show 3eb2be3:<path>`) as a starting point rather than reinventing it.
+We built and then deliberately removed a Render-specific MCP integration. The integration was Render-specific, but the *mechanisms* it used are generic and worth reusing the next time this repo needs to bake in a new capability and wire it up at boot.
+
+> **Removing a capability from this repo does not remove it from instances already running.** The strip took the `mcp_servers.render` entry out of the boot patcher, but `/opt/data` survives every deploy, so the entry stayed on the live instance's volume until it was swept by hand on 2026-07-30 (`plans/clean-boot-logs-plan.md` §3). Any future strip needs a volume sweep of already-provisioned instances plus a smoke-test assertion for the fresh-boot case — the code change alone only covers instances that don't exist yet. Rather than leave that code sitting around unused as a template, it's captured here — pull the actual implementation from git history (`git show 3eb2be3:<path>`) as a starting point rather than reinventing it.
 
 ### Pattern 1: boot-time idempotent config mutation
 
@@ -202,7 +205,7 @@ The moving parts:
 3. **A boot wait loop** (90s ceiling) that polls `/api/status` *through Caddy on :10000*, so reaching `gateway_state: running` simultaneously proves the proxy's catch-all route works. It also bails early if the container has exited.
 4. **`docker exec`-based assertions** — the script runs commands *inside* the container (`curl`, `ps`, `grep`, `test -f`, and Python one-liners against Hermes' own venv) and checks their output or exit status. That's the whole trick: `docker exec` lets a plain shell script inspect live in-container state without SSH or a test framework.
 
-The nine checks, and the failure each exists to catch:
+The ten checks, and the failure each exists to catch:
 
 | Check | Catches |
 | --- | --- |
@@ -214,6 +217,7 @@ The nine checks, and the failure each exists to catch:
 | `render_mention.py` present **and** importable as `plugins.platforms.line.render_mention` | The `COPY` landed at the wrong path, or the file exists but isn't importable as part of the package (a property of the editable install, not of the file being on disk) |
 | `_mention_gate` in `adapter.py` **and** the patched adapter imports | `line-group-mention.patch` didn't apply, or applied and introduced an `ImportError` that would only surface as a dead LINE channel on a client instance |
 | `/opt/render-tools/skills-local` in `/opt/data/config.yaml` | The boot-time config patcher didn't run or didn't land — covers its shebang, PyYAML in Hermes' venv, and cont-init hook ordering all at once |
+| **No** `mcp.render.com` / `RENDER_MCP_API_KEY` in `/opt/data/config.yaml` | Something in the boot path registering Render account access on a client-facing agent — the inverse of the check above, and the inversion of "only admins manage Render resources" |
 | `LineInviteStore` + `qrcode` importable | Our patch didn't provide the class, or upstream dropped the `qrcode` dependency — otherwise discovered by a manager whose QR invite command fails |
 
 Why so much of it asserts *state* rather than reading logs is Pattern 4 above: a swallowed exception or a failed privilege drop will still print a success-shaped log line. Several of these checks are specifically designed to be things `docker logs` cannot tell you.
@@ -222,7 +226,7 @@ Cost: about 33 seconds on a warm cache, plus a multi-GB base-image pull the firs
 
 ### The validation surface
 
-- `./scripts/smoke-test.sh` — builds and boots the image the way Render does, then asserts it stays up, the gateway reaches `running`, Caddy routes (including `/line/*` to the LINE backend), the dashboard auth gate is armed, the patched LINE adapter and mention-gate module import, `skills.external_dirs` landed in `config.yaml`, and the `line-invite` skill's dependencies resolve. Requires Docker. Extend this file's assertions rather than adding a separate test runner for anything that only matters at boot.
+- `./scripts/smoke-test.sh` — builds and boots the image the way Render does, then asserts it stays up, the gateway reaches `running`, Caddy routes (including `/line/*` to the LINE backend), the dashboard auth gate is armed, the patched LINE adapter and mention-gate module import, `skills.external_dirs` landed in `config.yaml`, no Render MCP entry is present, and the `line-invite` skill's dependencies resolve. Requires Docker. Extend this file's assertions rather than adding a separate test runner for anything that only matters at boot.
 - `./scripts/upgrade-preflight.sh <candidate-tag>` — read-only upstream drift check for a `HERMES_IMAGE` bump; no Docker, no clone, about a minute. Its `DEPS` / `SYMBOLS` / `STRUCTURE` tables are the maintained inventory of everything in this repo that reaches into upstream internals. See `UPGRADING.md`.
 - `python3 -m pytest tests/ -q` — unit tests that need neither a container nor an upstream clone:
   - `tests/test_render_mention.py` — the mention gate.
