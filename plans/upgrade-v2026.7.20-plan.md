@@ -1,8 +1,8 @@
 # Hermes bump: `v2026.7.7.2` → `v2026.7.20`
 
-Status as of **2026-07-30**: local work complete and verified. **Not yet deployed.**
-Followed `UPGRADING.md`. This entry exists for the Phase 3-5 items that are not
-done, and for the two findings that outlived the bump.
+Status as of **2026-07-30**: **deployed and verified live** (`79ba3ad`).
+Followed `UPGRADING.md`. One verification step is left, and it needs a human in
+a LINE group — see "Outstanding" below.
 
 ## Where it stands
 
@@ -11,31 +11,70 @@ done, and for the two findings that outlived the bump.
 | 0 — release notes | done |
 | 1 — preflight | done: `1 blockers, 6 to review` |
 | 2 — bump + build | done: patches apply unchanged, 99 unit tests, 9/9 smoke assertions |
-| 3 — deploy | **not started** — needs a push + a manual Render deploy |
-| 4 — verify live instance | **blocked on Phase 3** |
-| 5 — close the loop | done except the Phase 4-dependent notes |
+| 3 — deploy | done — deployed by Matt |
+| 4 — verify live instance | done except step 5's negative mention test |
+| 5 — close the loop | done |
 
-`Dockerfile`'s `ARG HERMES_IMAGE` is already on `v2026.7.20` on `main`'s working
-tree. Nothing is deployed until someone triggers it — `render.yaml` sets
-`autoDeployTrigger: off`.
+Live instance confirms `version 0.19.0`, `release_date 2026.7.20`,
+`config_version 33 == latest_config_version 33` (no pending config migration),
+`gateway_state: running`, LINE + Telegram both `connected`.
 
-## Outstanding — do these in order
+### Phase 4 results
 
-1. **Deploy** (Phase 3). Push, then trigger from the Render dashboard.
-   Remember `healthCheckPath: /api/status` is served by the dashboard and will
-   report green over a wedged gateway. Render saying "live" is not evidence.
-2. **Phase 4, all six steps.** Do not skip step 5 (the real LINE round trip) —
-   Phase 2 proves the patches *apply and import*, never that they *work*.
-3. **`session_reset.mode` decision — the one behavior change with client impact.**
-   Upstream flipped the default `both` → `none`. Our `/opt/data/config.yaml`
-   persists across deploys, so this only bites if the key is *absent* there and
-   inherited. Check with `grep -nA3 session_reset /opt/data/config.yaml`:
-   - present → nothing to do, we were never inheriting it.
-   - absent → client LINE sessions silently stop auto-resetting after this
-     deploy. Context grows until `/reset` or compression, which is a cost and
-     context change nobody asked for. Set it explicitly to keep the old
-     behavior; that's a deliberate edit, since `scripts/patch-config.py` is
-     insert-only and will not do it.
+1. **Both supervised processes up** — `hermes gateway run --replace` and
+   `caddy run`, not just the dashboard.
+2. **`hermes doctor`** — 4 issues, none bump-related and all pre-existing: a
+   missing `~/.local/bin/hermes` symlink, npm vulns in upstream's `web` and
+   `ui-tui` workspaces, and unconfigured optional API keys. The known stale
+   `mcp_servers.render` entry is still on the volume; `RENDER_MCP_API_KEY` is
+   **not** set in `/opt/data/.env`, so it is inert cruft, not live Render
+   access on a client-facing instance. Removal remains a deliberate manual
+   edit (`scripts/patch-config.py` is insert-only).
+3. **Changed default — acted on.** See below.
+4. **Volume state survived.** `pairing/` (`line-approved.json`,
+   `line-pending.json`, `_rate_limits.json`) and `line-invites/invites.json`
+   intact. `line-modes/` does not exist, which is **correct** — no group has
+   ever had an explicit mode set, so groups follow the `LINE_REQUIRE_MENTION`
+   default, which the patch documents as mention-required. The store is
+   created on first write.
+5. **LINE round trip** — DM to an approved user replied; an @-mentioned group
+   message replied. The negative half is still outstanding (below).
+6. **env-sync restart path proven** — `restart-only ngraph-main` reported
+   `restart verified (pid=5214, start_time=988680740)`, i.e. both fields
+   changed. `gateway/run.py`'s USR1 plumbing survived a 3359-line diff.
+
+### `session_reset` — the one change with client impact (resolved)
+
+`session_reset` was **absent** from `/opt/data/config.yaml`, so the instance was
+inheriting the upstream default, which this release flipped `both` → `none`.
+Client LINE sessions had silently stopped auto-resetting.
+
+Fixed on 2026-07-30: an explicit block was appended to
+`/opt/data/config.yaml` (backup at `config.yaml.bak-20260730-063125`) pinning
+the pre-upgrade behavior, and confirmed effective via
+`hermes config get session_reset.mode` → `both` after the restart.
+
+```yaml
+session_reset:
+  mode: both
+  idle_minutes: 1440
+  at_hour: 4
+```
+
+Setting it explicitly also makes the instance immune to future flips of this
+key — which is the general lesson: **a default we inherit is a setting upstream
+controls.** When a `CONFIG DEFAULT` line in the preflight names a key we care
+about, pin it rather than re-deciding it every bump.
+
+## Outstanding
+
+- **Phase 4 step 5, negative half:** confirm a group message *without* an
+  `@`-mention gets **no** reply in a mention-mode group. Must be attempted
+  more than `LINE_MENTION_FOLLOWUP_SECONDS` (default 90s) after the last
+  mention by that same user, or from a different user — otherwise the
+  follow-up window legitimately answers an unmentioned message and the test
+  proves nothing. This is the only assertion that distinguishes "the mention
+  patch applied and imports" from "the mention patch gates."
 
 ## Two findings worth carrying forward
 

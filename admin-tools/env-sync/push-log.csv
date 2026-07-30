@@ -1,2 +1,3 @@
 timestamp_utc,operator,slug,action,outcome,keys_added,keys_changed,keys_removed,gateway_pid,gateway_start_time
 2026-07-28T23:52:30Z,matthewchana,ngraph-main,push,ok,LINE_ALLOWED_GROUPS,,,5784,
+2026-07-30T06:33:11Z,matthewchana,ngraph-main,restart-only,ok,,,,5214,988680740
