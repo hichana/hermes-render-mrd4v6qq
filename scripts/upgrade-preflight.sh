@@ -54,6 +54,7 @@ DEPS=(
   "gateway/run.py|review|the USR1 restart path admin-tools/env-sync verifies against"
   "hermes_cli/container_boot.py|review|profile reconciler; see HISTORICAL-GOTCHAS.md"
   "cli-config.yaml.example|review|documents the config defaults live instances inherit"
+  "hermes_cli/config.py|review|DEFAULT_CONFIG — the defaults NOT documented in cli-config.yaml.example"
   "tests/gateway/test_line_plugin.py|review|target of line-dm-pairing.tests.patch — not in the image, but re-verified against a clone during patch regeneration"
 )
 
@@ -120,8 +121,49 @@ trap 'rm -rf "${WORK}"' EXIT
 blockers=0
 reviews=0
 
+# Every check below reads a *fetch failure* as a statement about upstream, so
+# fetch has to distinguish "upstream doesn't ship this" from "we couldn't ask".
+# GitHub answers 429 under rate limiting, and a 429 body diffs exactly like a
+# deleted file: MISSING(blocker) on a path upstream still ships, plus inflated
+# churn counts on every neighbour. That sends you regenerating patches against
+# a move that never happened. See UPGRADING.md Phase 1.
+#
+#   0 — fetched
+#   1 — upstream genuinely does not have it (HTTP 404, or absent fixture file)
+#   2 — could not tell (rate limit, 5xx, network). Never a verdict.
+FETCH_STATUS=""
 fetch() { # tag path outfile
-  curl -sfL --retry 2 "${RAW_BASE}/$1/$2" -o "$3" 2>/dev/null
+  local url="${RAW_BASE}/$1/$2" rc=0
+  FETCH_STATUS=""
+  # No -f: we need the status code, which -f throws away.
+  FETCH_STATUS="$(curl -sL --retry 2 -w '%{http_code}' -o "$3.part" "${url}" 2>/dev/null)" || rc=$?
+  case "${FETCH_STATUS}" in
+    200) mv "$3.part" "$3"; return 0 ;;
+    404) rm -f "$3.part"; return 1 ;;
+    000|"")
+      # No HTTP status at all: either a file:// URL (fixtures, always 000) or
+      # a transport failure. curl's exit code is the only discriminator.
+      if [[ "${rc}" -eq 0 ]]; then mv "$3.part" "$3"; return 0; fi
+      rm -f "$3.part"
+      if [[ "${RAW_BASE}" == file://* ]]; then
+        return 1 # fixture simply isn't there
+      fi
+      return 2
+      ;;
+    *) rm -f "$3.part"; return 2 ;;
+  esac
+}
+
+# A transient failure invalidates the whole run, not just one line of it: the
+# checks downstream would report drift they never actually measured. Abort
+# before printing any verdict.
+abort_transient() { # tag path
+  echo >&2
+  echo "FAIL: could not fetch $2 at $1 (HTTP ${FETCH_STATUS:-none})." >&2
+  echo "      This is a transport failure, not upstream drift — GitHub rate" >&2
+  echo "      limiting looks identical to a deleted file. No verdict printed;" >&2
+  echo "      wait a minute and re-run." >&2
+  exit 3
 }
 
 local_path() { # tag path
@@ -135,7 +177,11 @@ echo "    source: ${RAW_BASE}"
 # reads as "upstream deleted the file" instead of "you typo'd the tag".
 for tag in "${CURRENT}" "${CANDIDATE}"; do
   mkdir -p "${WORK}/${tag}"
-  if ! fetch "${tag}" Dockerfile "$(local_path "${tag}" Dockerfile)"; then
+  rc=0
+  fetch "${tag}" Dockerfile "$(local_path "${tag}" Dockerfile)" || rc=$?
+  if [[ "${rc}" -eq 2 ]]; then
+    abort_transient "${tag}" Dockerfile
+  elif [[ "${rc}" -ne 0 ]]; then
     echo "FAIL: tag '${tag}' not found at ${RAW_BASE} (no Dockerfile there)" >&2
     exit 1
   fi
@@ -148,8 +194,15 @@ for entry in "${DEPS[@]}"; do
   IFS='|' read -r path severity note <<<"${entry}"
   old="$(local_path "${CURRENT}" "${path}")"
   new="$(local_path "${CANDIDATE}" "${path}")"
-  [[ -f "${old}" ]] || fetch "${CURRENT}" "${path}" "${old}" || true
-  [[ -f "${new}" ]] || fetch "${CANDIDATE}" "${path}" "${new}" || true
+  for spec in "${CURRENT}|${old}" "${CANDIDATE}|${new}"; do
+    IFS='|' read -r tag dest <<<"${spec}"
+    [[ -f "${dest}" ]] && continue
+    rc=0
+    fetch "${tag}" "${path}" "${dest}" || rc=$?
+    if [[ "${rc}" -eq 2 ]]; then
+      abort_transient "${tag}" "${path}"
+    fi
+  done
 
   if [[ ! -f "${new}" ]]; then
     echo "  MISSING(blocker): ${path} — not present at ${CANDIDATE} (${note})"
@@ -210,6 +263,15 @@ echo "==> Config defaults live instances inherit"
 # Filter to actual key: value lines so a changed *default* surfaces instead of
 # drowning in the comment churn that dominates this file's diff. Comments are
 # excluded on purpose — a rewritten explanation is not a behavior change.
+#
+# KNOWN LIMIT: this reads cli-config.yaml.example only, and not every default
+# is documented there — the file itself now defers some blocks to
+# "DEFAULT_CONFIG in hermes_cli/config.py". Those are covered only as a
+# DRIFT(review) line on hermes_cli/config.py, which means "go read it", not
+# "a default changed". Parsing the Python dict is not worth the machinery;
+# Phase 0's release-notes read is the intended backstop. Verified in the
+# v2026.7.20 bump: the notes flagged display.show_reasoning, which appears
+# nowhere in the example file (it was unchanged at True in both tags).
 old_cfg="$(local_path "${CURRENT}" cli-config.yaml.example)"
 new_cfg="$(local_path "${CANDIDATE}" cli-config.yaml.example)"
 if [[ -f "${old_cfg}" && -f "${new_cfg}" ]]; then

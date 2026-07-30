@@ -7,7 +7,7 @@ Run this every time. Not just when the release notes look scary.
 `/opt/data` (the Render disk) is the only thing that survives, which is also where every config migration lands.
 Upstream ships ~2,000+ commits between releases. Assume every bump can move the ground under the image.
 
-**Why the ceremony:** the one bump we've done (`eec0255`, 2026-07-09, `v2026.5.7` → `v2026.7.7.2`) was a bare one-line tag edit.
+**Why the ceremony:** the first bump we did (`eec0255`, 2026-07-09, `v2026.5.7` → `v2026.7.7.2`) was a bare one-line tag edit.
 Upstream had moved to s6-overlay, repointed `/usr/bin/tini` at `/init`, and dropped `gosu`.
 The container booted wedged and **stayed that way for 8 days** while `healthCheckPath: /api/status` kept answering `200`.
 Six commits to clean up (`c113823` onward). Every phase below exists because of something in that incident.
@@ -38,6 +38,8 @@ Read `scripts/upgrade-preflight.sh`'s `DEPS` / `SYMBOLS` / `STRUCTURE` tables �
 The last line is `PREFLIGHT: <n> blockers, <m> to review`.
 Non-zero exit means do not build yet.
 
+**If there is no `PREFLIGHT:` line at all, you have no result** — not a clean one and not a bad one. The script exits **3** without a verdict when a fetch fails for a reason that isn't upstream's doing (GitHub rate limiting, a 5xx, no network). Wait a minute and re-run; nothing below applies until you get a verdict line. This exists because a rate-limited run used to report `MISSING(blocker)` on files upstream still ships — see `HISTORICAL-GOTCHAS.md`, "A red preflight looked like upstream drift."
+
 ### What each finding means
 
 | Finding | What it means | Do this |
@@ -57,6 +59,8 @@ The blocker was `adapter.py`, a single 2-line `hmac.compare_digest` fix at ~L275
 `plugin.yaml`, `gateway/pairing.py` and `docker/main-wrapper.sh` byte-identical; all 15 tracked symbols and all 6 image-shape assumptions intact.
 The real finding was in the config section: `session_reset.mode` default flipped `both` → `none`.
 Also worth knowing: `/usr/bin/tini` is no longer a symlink to `/init`, it's a real shim script (`docker/tini-shim.sh`) — harmless for us because we don't override `ENTRYPOINT`, and a good reminder of why we don't.
+Phases 2-3 then confirmed it: both patches applied unchanged, 99 unit tests green, all 9 smoke assertions green.
+One process note from that run — the **first** preflight attempt printed `2 blockers`, the extra one being `MISSING(blocker): docker/main-wrapper.sh`. That was GitHub rate limiting, not upstream; the fix and the lesson are in `HISTORICAL-GOTCHAS.md`. If a run's findings contradict this worked example, suspect the run before the example.
 
 ## Phase 2 — Bump and build locally
 

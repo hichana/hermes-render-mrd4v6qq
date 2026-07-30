@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import re
 import subprocess
+import threading
 import unittest
+from functools import partial
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -236,6 +239,108 @@ class TestTagResolution(PreflightCase):
         self.assertIn(CURRENT, result.stdout)
         self.assertIn("PREFLIGHT: 0 blockers, 0 to review", result.stdout)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class _FixtureHandler(BaseHTTPRequestHandler):
+    """Serves the fixture tree over real HTTP, with per-path status injection.
+
+    ``file://`` cannot express "GitHub rate-limited you" — the distinction
+    between HTTP 404 and HTTP 429 is the entire point of these tests, so they
+    need a transport that actually carries status codes.
+    """
+
+    def __init__(self, *args, root: Path, statuses: dict, **kwargs):
+        self._root = root
+        self._statuses = statuses
+        super().__init__(*args, **kwargs)
+
+    def log_message(self, *args):  # keep pytest output clean
+        pass
+
+    def do_GET(self):
+        rel = self.path.lstrip("/")
+        forced = next(
+            (code for suffix, code in self._statuses.items() if rel.endswith(suffix)),
+            None,
+        )
+        if forced is not None:
+            self.send_response(forced)
+            self.end_headers()
+            self.wfile.write(b"rate limit exceeded\n")
+            return
+        target = self._root / rel
+        if not target.is_file():
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class TestTransientFetchFailure(PreflightCase):
+    """A fetch that failed for infrastructure reasons must never read as drift.
+
+    The 8-day incident in UPGRADING.md came from trusting a green preflight.
+    The mirror-image failure is trusting a red one: a rate-limited run reports
+    ``MISSING(blocker)`` for a file upstream still ships, and inflates every
+    DRIFT count, which sends you regenerating patches against a phantom move.
+    """
+
+    def serve(self, statuses: dict):
+        write_tree(self.tags_dir, CURRENT, self.old)
+        write_tree(self.tags_dir, CANDIDATE, self.new)
+        handler = partial(_FixtureHandler, root=self.tags_dir, statuses=statuses)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_address[1]}"
+
+    def run_over_http(self, statuses: dict):
+        base = self.serve(statuses)
+        return subprocess.run(
+            [str(SCRIPT), CANDIDATE, CURRENT],
+            cwd=str(REPO_ROOT),
+            env={
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                "PREFLIGHT_RAW_BASE": base,
+            },
+            capture_output=True,
+            text=True,
+        )
+
+    def test_clean_run_over_http_matches_the_file_transport(self):
+        result = self.run_over_http({})
+        self.assertIn("PREFLIGHT: 0 blockers, 0 to review", result.stdout)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rate_limited_file_is_not_reported_as_deleted_upstream(self):
+        result = self.run_over_http({"docker/main-wrapper.sh": 429})
+        out = result.stdout + result.stderr
+        self.assertNotIn("MISSING(blocker)", out)
+        self.assertIn("429", out)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_rate_limited_run_aborts_instead_of_reporting_a_verdict(self):
+        result = self.run_over_http({"gateway/run.py": 429})
+        self.assertNotIn("PREFLIGHT:", result.stdout)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_genuine_404_over_http_is_still_a_blocker(self):
+        del self.new["docker/s6-rc.d/user/contents.d/main-hermes"]
+        result = self.run_over_http({})
+        self.assertIn("MISSING(blocker)", result.stdout)
+        self.assertIn("PREFLIGHT: 1 blockers", result.stdout)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_server_error_is_treated_as_transient_too(self):
+        result = self.run_over_http({"hermes_constants.py": 503})
+        out = result.stdout + result.stderr
+        self.assertNotIn("MISSING(blocker)", out)
+        self.assertNotIn("DRIFT", out)
+        self.assertNotEqual(result.returncode, 0)
 
 
 class TestConfigDefaultDrift(PreflightCase):

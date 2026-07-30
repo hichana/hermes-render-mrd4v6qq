@@ -17,7 +17,7 @@
 # Pin the upstream tag here. Bumping it is NOT a one-line change: follow
 # UPGRADING.md, starting with `./scripts/upgrade-preflight.sh <new-tag>`.
 # The last bump was done as a bare tag edit and ran wedged for 8 days.
-ARG HERMES_IMAGE=docker.io/nousresearch/hermes-agent:v2026.7.7.2
+ARG HERMES_IMAGE=docker.io/nousresearch/hermes-agent:v2026.7.20
 ARG CADDY_IMAGE=docker.io/library/caddy:2.10-alpine
 FROM ${CADDY_IMAGE} AS caddy
 FROM ${HERMES_IMAGE}
@@ -64,6 +64,11 @@ RUN cd /opt/hermes && git apply -p1 --verbose /tmp/line-dm-pairing.patch \
 # exist, and the image now ships a prebuilt ui-tui/dist/entry.js, which
 # hermes_cli/main.py treats as "the single runtime artefact" (prebuilt bundle
 # mode). Nothing reads ink-bundle.js anymore.
+#
+# Re-verified against v2026.7.20: ui-tui/ and node_modules/ still ship
+# root:root (so this chown is still load-bearing), dist/entry.js is still
+# prebuilt, and neither function is back — `_tui_build_needed` survives only
+# as a stale docstring mention in main.py, not as a definition.
 RUN chown -R hermes:hermes /opt/hermes/ui-tui /opt/hermes/node_modules
 
 # --- line-invite skill (plans/line-dm-pairing-plan.md, Phase 6c) ---
@@ -131,8 +136,15 @@ RUN install -d -o hermes -g hermes -m 0755 /opt/data
 # drops to the hermes user via s6-setuidgid.
 #
 # Overriding ENTRYPOINT here is what broke the v2026.5.7 → v2026.7.7.2
-# upgrade: /usr/bin/tini is now a symlink to /init, so the old
+# upgrade: /usr/bin/tini had become a symlink to /init, so the old
 # `tini -g -- bootstrap.sh` line resolved to `/init -g -- ...` and s6 tried
-# to run `-g` as the main program (exit 127). Leave the image's own
-# ENTRYPOINT alone; put boot work in /etc/cont-init.d/ instead.
+# to run `-g` as the main program (exit 127).
+#
+# As of v2026.7.20 /usr/bin/tini is no longer that symlink — it's a real
+# shim script (upstream docker/tini-shim.sh) that forwards to /init. The
+# lesson is unchanged and the reason is the point: what `tini` resolves to
+# is upstream's business and has already been redefined twice. We don't
+# depend on it either way, because we don't override ENTRYPOINT.
+# Leave the image's own ENTRYPOINT alone; put boot work in
+# /etc/cont-init.d/ instead.
 CMD ["gateway", "run"]

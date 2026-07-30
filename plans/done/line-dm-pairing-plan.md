@@ -37,7 +37,11 @@ git clone --branch v2026.7.7.2 --depth 1 \
 
 Before trusting anything you read there as "what's actually deployed," re-verify it's byte-identical to the pulled image first (see the Phase 4 findings below for why this matters and the exact commands) — a public tag and a pulled image can in principle drift, so this check is cheap insurance, not ceremony.
 
-**On every future session touching this plan:** check whether `HERMES_IMAGE` in the `Dockerfile` still matches what this plan was verified against (`v2026.7.7.2`). If it's been bumped, treat every patch in `patches/` as unverified until you re-run the regeneration procedure in `patches/README.md`.
+**On every future session touching this plan:** check whether `HERMES_IMAGE` in the `Dockerfile` still matches what this plan was verified against (`v2026.7.20`). If it's been bumped, treat every patch in `patches/` as unverified until you re-run the regeneration procedure in `patches/README.md`.
+
+> Patch-verification history. The plan's own body below was written against `v2026.7.7.2`; the line numbers and clone commands in it still say so deliberately, since that's the tree the patches were authored from.
+> - `v2026.7.7.2` — original authoring and verification.
+> - `v2026.7.20` (2026-07-30) — both patches re-verified to apply unchanged via UPGRADING.md Phase 2's in-image `git apply` check. Upstream's only change to `adapter.py` was a 2-line `hmac.compare_digest` bytes fix at ~L275, nowhere near any of our hunks, so no regeneration was needed.
 
 ---
 

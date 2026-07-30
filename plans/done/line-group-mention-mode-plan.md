@@ -102,7 +102,7 @@ still the artifact to offer Nous as a PR.
 
 ## Reference — confirmed internals (live instance, 2026-07-28)
 
-Post-patch line numbers (image `v2026.7.7.2` + `patches/line-dm-pairing.patch`).
+Post-patch line numbers (image `v2026.7.7.2` + `patches/line-dm-pairing.patch`). Still accurate under `v2026.7.20`: upstream's only `adapter.py` change in that bump was a 2-line edit at ~L275, so anything below L275 shifts by +2 and anything above is unmoved.
 
 - **`_resolve_chat` — adapter.py:412.** Already returns `(chat_id, chat_type)`
   with `chat_type` ∈ `dm|group|room`. No new source parsing needed.
