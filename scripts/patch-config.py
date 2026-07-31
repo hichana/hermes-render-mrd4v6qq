@@ -1,7 +1,7 @@
 #!/opt/hermes/.venv/bin/python
 """Idempotent patcher for Hermes' ~/.hermes/config.yaml on Render.
 
-Adds one thing the first time it runs against a given config.yaml:
+Adds things the first time it runs against a given config.yaml:
 
   skills.external_dirs -- exposes this repo's `skills/` bundle (baked into
   the image at /opt/render-tools/skills-local) to skills_list() and the /
@@ -9,6 +9,11 @@ Adds one thing the first time it runs against a given config.yaml:
   flow on /opt/data/skills. Currently that bundle is just `line-invite`
   (plans/line-dm-pairing-plan.md Phase 6c) — the manager-initiated LINE
   join-invite QR flow.
+
+  gateway.multiplex_profiles -- enables per-profile gateway processes,
+  allowing multiple agents (each with its own port and configuration) to
+  run on the same container. Declared in render.yaml; synced here into
+  the live config.
 
 The patcher is INSERT-only by design (repo CLAUDE.md Pattern 1). If the
 key already exists (even pointing somewhere different), it leaves it
@@ -74,6 +79,21 @@ def ensure_external_skill_dir(config: dict) -> bool:
     return True
 
 
+def ensure_gateway_multiplex(config: dict) -> bool:
+    """Set gateway.multiplex_profiles if missing. Returns True if changed."""
+    gateway = config.setdefault("gateway", {})
+    if not isinstance(gateway, dict):
+        print(
+            "[render-tools] gateway is not a mapping; skipping multiplex_profiles",
+            file=sys.stderr,
+        )
+        return False
+    if "multiplex_profiles" in gateway:
+        return False
+    gateway["multiplex_profiles"] = True
+    return True
+
+
 def save_config(path: Path, config: dict) -> None:
     text = yaml.safe_dump(
         config,
@@ -93,12 +113,18 @@ def main() -> int:
     path = Path(sys.argv[1])
     path.parent.mkdir(parents=True, exist_ok=True)
     config = load_config(path)
-    changed = ensure_external_skill_dir(config)
-    if changed:
+    skill_changed = ensure_external_skill_dir(config)
+    gateway_changed = ensure_gateway_multiplex(config)
+    if skill_changed or gateway_changed:
         save_config(path, config)
-        print(f"[render-tools] patched {path}: skills.external_dirs += {RENDER_SKILL_DIR}")
+        patches = []
+        if skill_changed:
+            patches.append(f"skills.external_dirs += {RENDER_SKILL_DIR}")
+        if gateway_changed:
+            patches.append("gateway.multiplex_profiles = true")
+        print(f"[render-tools] patched {path}: {', '.join(patches)}")
     else:
-        print(f"[render-tools] {path} already has {RENDER_SKILL_DIR}; nothing to do")
+        print(f"[render-tools] {path} already up to date; nothing to do")
     return 0
 
 

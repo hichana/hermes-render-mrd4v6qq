@@ -16,6 +16,25 @@ The disk holds everything that should survive a redeploy: API keys (`.env`), con
 
 There's a single container filesystem here, not a VM with a separate OS inside it — Render runs one Linux container from the image this repo's `Dockerfile` builds, and everything you can interact with (Hermes, Caddy, s6, the dashboard) lives inside that one filesystem. Within it, the split that actually matters is ephemeral vs. persistent: `/opt/hermes` (the Hermes binary, its Python venv, static assets) comes from the image layers and resets to its baked-in state on every redeploy, while `/opt/data` (`HERMES_HOME`) is the mounted persistent disk and is the only part that survives across deploys. The dashboard's file browser is scoped to `/opt/data`, not the whole container — that's why you'll see agent-owned files like `SOUL.md` there but never `/opt/hermes`; reaching the image-baked side requires SSH (see [Shell access](#shell-access)).
 
+### Ephemeral vs. persistent: the file structure
+
+- **`/opt/hermes/`** — the Hermes application code, rebuilt from scratch on every deploy. Not a profile, and not a configuration directory. Anything you need to survive a redeploy must go in `/opt/data/`.
+- **`/opt/data/`** — the persistent volume (mounted disk). This is the only part that survives redeploys, and it is the **default profile's home**. It contains:
+  - **`config.yaml`** — main Hermes configuration (modified at boot via `scripts/patch-config.py`, readable+editable from the dashboard)
+  - **`.env`** — environment variables (provider keys, platform tokens, etc.), managed via `admin-tools/env-sync` or the dashboard
+  - **`platforms/`** — platform-specific state (LINE pairing approvals, invites, group modes; all re-read on every message, no restart needed)
+  - **`profiles/`** — profile metadata directory (see below)
+  - **`skills/`, `memories/`, `logs/`, etc.** — agent runtime state (installed skills, learned context, audit trails)
+
+**Multi-profile architecture:** When `gateway.multiplex_profiles: true` is set, each profile gets its own gateway process on a separate port with its own configuration. The default profile's main state lives directly in `/opt/data/`; additional profiles and their metadata live under `profiles/`:
+
+- **`profiles/default/`** — metadata for the default profile (e.g., `pairing/` for default-profile-specific access control)
+- **`profiles/<other>/`** — if additional profiles exist (e.g., `ngraph-agent/`), each gets its own directory tree here with its own `config.yaml`, `.env`, and `pairing/` state
+
+The `profiles/` directory is ephemeral for new profiles (created on first-boot if `gateway.multiplex_profiles` is enabled), but any state written there persists across restarts. Each profile runs independently: different ports, different configurations, different platform tokens, different access lists.
+
+When you SSH in and explore the instance, everything under `/opt/data/` survives deploys. Everything under `/opt/hermes/` is ephemeral and gets rebuilt. The dashboard's file browser and all operator interactions read from `/opt/data/`; SSH access is required to see `/opt/hermes/`.
+
 Our intention is for one logical agent to exist on a Render server deployment, with multiple agents able to be provisioned by us for a given business.
 
 Each agent needs:
