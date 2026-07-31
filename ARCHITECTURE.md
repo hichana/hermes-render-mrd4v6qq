@@ -151,6 +151,15 @@ Four mechanisms, three of them file-backed:
 | One-off QR join invites | `/opt/data/platforms/line-invites/invites.json` | every message |
 | Per-group response mode | `/opt/data/platforms/line-modes/modes.json` | every message |
 
+#### `LINE_HOME_CHANNEL` — default destination for cron jobs and notifications
+
+Despite its name, `LINE_HOME_CHANNEL` is not restricted to channels. It specifies the default LINE chat ID for scheduled tasks and notifications sent with `deliver=line`. The value can be:
+- A **User ID** (1:1 DM, prefix `U`) — e.g. `Ubefef83519a4a434331aec8922709e11`
+- A **Group ID** (group chat, prefix `C`) — e.g. `C82ce84d7675b82329e6c84564cd74813`
+- A **Room ID** (other multi-person chat variant, prefix `R`)
+
+The variable is **optional**: if no cron jobs use `deliver=line`, it can be left empty. Like other env vars, changes require a verified restart (`admin-tools/env-sync push`).
+
 **DM access is the union of env + pairing store.** A user is authorized if they're in **either** `LINE_ALLOWED_USERS` **or** `line-approved.json` — an OR, not one superseding the other. Someone can have working access purely from a redeemed invite code or an operator `hermes pairing approve`, and never appear in `.env` at all. So "who currently has LINE access" always requires reading both, over SSH. Render's dashboard/`.env` view shows only the env half and is never the full picture. (`clients/<slug>.env` is a fine local shortcut for the env half *only* if it's both fully pushed **and** known to track every relevant remote key — a clean `diff` proves the first, not the second, per the env-sync section above. The pairing half always needs SSH.)
 
 **Pairing and invites** both flow through `PairingStore.is_approved()`. Under `dm_policy: pairing` (the default, from `patches/line-dm-pairing.patch`) an unrecognized DM falls through to the gateway's pairing logic and the sender gets a code for an operator to approve, rather than being dropped. `LineInviteStore` is deliberately a separate store: an invite token is minted ahead of time by the `line-invite` skill and grants access on redemption with no approval step. Because these re-read on every message, they're the right tool for a quick revoke/re-grant test loop.
