@@ -105,3 +105,5 @@ services:
       # server (API_SERVER_ENABLED=true).
       - key: HERMES_GATEWAY_TOKEN
         generateValue: true
+gateway:
+  multiplex_profiles: true
