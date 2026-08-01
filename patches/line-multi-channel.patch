@@ -1,5 +1,5 @@
 diff --git a/plugins/platforms/line/adapter.py b/plugins/platforms/line/adapter.py
-index 36df182..bbffc84 100644
+index 36df182..8ae9b0a 100644
 --- a/plugins/platforms/line/adapter.py
 +++ b/plugins/platforms/line/adapter.py
 @@ -97,6 +97,7 @@ from gateway.platforms.base import (
@@ -237,9 +237,58 @@ index 36df182..bbffc84 100644
      def _is_dm_intake_allowed(self, user_id: str) -> bool:
          """Whether an unrecognized DM may reach the gateway (pairing handshake path)."""
          if self._dm_policy == "disabled":
-@@ -992,41 +1137,56 @@ class LineAdapter(BasePlatformAdapter):
+@@ -991,42 +1136,105 @@ class LineAdapter(BasePlatformAdapter):
+     # Connection lifecycle
      # ------------------------------------------------------------------
  
++    def _register_in_profile_adapters(self) -> None:
++        """Register this one shared adapter under every additional
++        channel's own profile key too, not just the default profile's
++        ``self.adapters``.
++
++        Without this, ``gateway/authz_mixin.py::_authorization_adapter``
++        (used for the unauthorized-DM pairing-code flow, among other
++        things) looks for a LINE adapter under
++        ``runner._profile_adapters[<profile>][Platform.LINE]``, finds
++        nothing (a non-default channel's own config.yaml has LINE
++        explicitly disabled — see the #50051 workaround in
++        ``ADDING-A-CLIENT-AGENT.md``), and *fails closed* by design ("must
++        NOT fall back to the default profile's adapter — that sends
++        replies out the wrong bot"). That fail-closed behavior is correct
++        for the normal case (one adapter instance per profile per
++        platform) but wrong for this one: there is only ever one
++        ``LineAdapter``, and its ``send()`` never trusts ``profile`` for
++        credential resolution anyway — only ``chat_id``, via
++        ``ChannelRegistry.channel_for_chat()``, which is unambiguous
++        (LINE's own IDs are channel-scoped). Confirmed live, 2026-08-02:
++        without this, a message on a non-default channel that needs a
++        pairing-code reply gets no reply at all — silently, no exception,
++        no log line beyond the original "Unauthorized user".
++        """
++        runner = getattr(self, "gateway_runner", None)
++        profile_adapters = getattr(runner, "_profile_adapters", None)
++        if not isinstance(profile_adapters, dict):
++            return
++        for ch in self._channels.all():
++            if ch.profile != line_multiplex.DEFAULT_PROFILE:
++                profile_adapters.setdefault(ch.profile, {})[self.platform] = self
++
++    def _unregister_from_profile_adapters(self) -> None:
++        """Undo ``_register_in_profile_adapters`` — only remove the
++        entries we added (this exact adapter object, under the
++        ``Platform.LINE`` key), never someone else's entry that happens
++        to share a profile name."""
++        runner = getattr(self, "gateway_runner", None)
++        profile_adapters = getattr(runner, "_profile_adapters", None)
++        if not isinstance(profile_adapters, dict):
++            return
++        for ch in self._channels.all():
++            if ch.profile == line_multiplex.DEFAULT_PROFILE:
++                continue
++            platform_map = profile_adapters.get(ch.profile)
++            if platform_map is not None and platform_map.get(self.platform) is self:
++                del platform_map[self.platform]
++
      async def connect(self, *, is_reconnect: bool = False) -> bool:
 -        if not self.channel_access_token or not self.channel_secret:
 +        unconfigured = [ch.profile for ch in self._channels.all() if not ch.is_configured()]
@@ -320,7 +369,7 @@ index 36df182..bbffc84 100644
  
          # Spin up the aiohttp webhook server.
          try:
-@@ -1040,9 +1200,17 @@ class LineAdapter(BasePlatformAdapter):
+@@ -1040,9 +1248,17 @@ class LineAdapter(BasePlatformAdapter):
              return False
  
          self._app = web.Application(client_max_size=WEBHOOK_BODY_MAX_BYTES)
@@ -341,8 +390,12 @@ index 36df182..bbffc84 100644
          # Media serving endpoint.
          self._app.router.add_get(
              f"{DEFAULT_MEDIA_PATH_PREFIX}/{{token}}/{{filename}}",
-@@ -1064,10 +1232,11 @@ class LineAdapter(BasePlatformAdapter):
+@@ -1062,12 +1278,15 @@ class LineAdapter(BasePlatformAdapter):
+             )
+             return False
  
++        self._register_in_profile_adapters()
++
          self._mark_connected()
          logger.info(
 -            "LINE: webhook listening on %s:%s%s%s",
@@ -355,7 +408,16 @@ index 36df182..bbffc84 100644
              f" (public: {self.public_base_url})" if self.public_base_url else "",
          )
          return True
-@@ -1098,13 +1267,19 @@ class LineAdapter(BasePlatformAdapter):
+@@ -1075,6 +1294,8 @@ class LineAdapter(BasePlatformAdapter):
+     async def disconnect(self) -> None:
+         self._mark_disconnected()
+ 
++        self._unregister_from_profile_adapters()
++
+         if self._site is not None:
+             try:
+                 await self._site.stop()
+@@ -1098,13 +1319,19 @@ class LineAdapter(BasePlatformAdapter):
          self._media_temp_paths.clear()
          self._media_tokens.clear()
  
@@ -382,7 +444,7 @@ index 36df182..bbffc84 100644
  
      # ------------------------------------------------------------------
      # Webhook handlers
-@@ -1117,6 +1292,19 @@ class LineAdapter(BasePlatformAdapter):
+@@ -1117,6 +1344,19 @@ class LineAdapter(BasePlatformAdapter):
      async def _handle_webhook(self, request) -> Any:
          from aiohttp import web
  
@@ -402,7 +464,7 @@ index 36df182..bbffc84 100644
          # Body cap defends against memory-exhaustion via crafted Content-Length
          # (aiohttp's client_max_size only applies to certain body modes).
          try:
-@@ -1128,7 +1316,7 @@ class LineAdapter(BasePlatformAdapter):
+@@ -1128,7 +1368,7 @@ class LineAdapter(BasePlatformAdapter):
              return web.Response(status=413, text="payload too large")
  
          signature = request.headers.get("X-Line-Signature", "")
@@ -411,7 +473,7 @@ index 36df182..bbffc84 100644
              return web.Response(status=401, text="invalid signature")
  
          try:
-@@ -1137,11 +1325,19 @@ class LineAdapter(BasePlatformAdapter):
+@@ -1137,11 +1377,19 @@ class LineAdapter(BasePlatformAdapter):
              return web.Response(status=400, text="bad json")
  
          events = payload.get("events", []) or []
@@ -436,7 +498,7 @@ index 36df182..bbffc84 100644
  
          return web.Response(status=200, text="ok")
  
-@@ -1155,9 +1351,25 @@ class LineAdapter(BasePlatformAdapter):
+@@ -1155,9 +1403,25 @@ class LineAdapter(BasePlatformAdapter):
              logger.debug("LINE: ignoring duplicate webhook event %s", webhook_event_id)
              return
  
@@ -463,7 +525,7 @@ index 36df182..bbffc84 100644
              return
  
          # Allowlist gate. DMs (source type "user") that aren't already
-@@ -1339,6 +1551,37 @@ class LineAdapter(BasePlatformAdapter):
+@@ -1339,6 +1603,37 @@ class LineAdapter(BasePlatformAdapter):
              user_name=user_id,
              chat_name=chat_id,
          )
@@ -501,7 +563,7 @@ index 36df182..bbffc84 100644
  
          event_obj = MessageEvent(
              text=text,
-@@ -1448,7 +1691,8 @@ class LineAdapter(BasePlatformAdapter):
+@@ -1448,7 +1743,8 @@ class LineAdapter(BasePlatformAdapter):
          reply_to: Optional[str] = None,
          metadata: Optional[Dict[str, Any]] = None,
      ) -> SendResult:
@@ -511,7 +573,7 @@ index 36df182..bbffc84 100644
              return SendResult(success=False, error="LINE adapter not connected")
  
          # System busy-acks (interrupting / queued / steered) bypass the
-@@ -1473,8 +1717,13 @@ class LineAdapter(BasePlatformAdapter):
+@@ -1473,8 +1769,13 @@ class LineAdapter(BasePlatformAdapter):
          *,
          force_push: bool,
      ) -> SendResult:
@@ -526,7 +588,7 @@ index 36df182..bbffc84 100644
  
          chunks = split_for_line(strip_markdown_preserving_urls(content))
          if not chunks:
-@@ -1484,14 +1733,14 @@ class LineAdapter(BasePlatformAdapter):
+@@ -1484,14 +1785,14 @@ class LineAdapter(BasePlatformAdapter):
          token, used_reply = self._consume_reply_token(chat_id)
          if used_reply and not force_push:
              try:
@@ -543,7 +605,7 @@ index 36df182..bbffc84 100644
              return SendResult(success=True, message_id=None)
          except Exception as exc:
              logger.error("LINE: push send failed: %s", exc)
-@@ -1512,8 +1761,9 @@ class LineAdapter(BasePlatformAdapter):
+@@ -1512,8 +1813,9 @@ class LineAdapter(BasePlatformAdapter):
  
      async def send_typing(self, chat_id: str, metadata=None) -> None:
          """Trigger LINE's loading-animation indicator (DM only)."""
@@ -555,7 +617,7 @@ index 36df182..bbffc84 100644
  
      async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
          """Best-effort chat info derived from the chat_id prefix.
-@@ -1542,9 +1792,11 @@ class LineAdapter(BasePlatformAdapter):
+@@ -1542,9 +1844,11 @@ class LineAdapter(BasePlatformAdapter):
          responsible for the typing-indicator heartbeat, while *this*
          wrapper layers in the slow-LLM postback bubble at threshold.
          """
@@ -568,7 +630,7 @@ index 36df182..bbffc84 100644
              or not chat_id
          ):
              await super()._keep_typing(chat_id, *args, **kwargs)
-@@ -1571,7 +1823,7 @@ class LineAdapter(BasePlatformAdapter):
+@@ -1571,7 +1875,7 @@ class LineAdapter(BasePlatformAdapter):
                  self.pending_text, self.button_label, rid
              )
              try:
@@ -577,7 +639,7 @@ index 36df182..bbffc84 100644
                  logger.info("LINE: sent slow-LLM postback button for chat %s (rid=%s)", chat_id, rid)
              except Exception as exc:
                  logger.warning("LINE: postback button send failed: %s", exc)
-@@ -1694,7 +1946,7 @@ class LineAdapter(BasePlatformAdapter):
+@@ -1694,7 +1998,7 @@ class LineAdapter(BasePlatformAdapter):
              return SendResult(success=False, error=f"image file not found: {image_path}")
          if path.stat().st_size > LINE_IMAGE_MAX_BYTES:
              return SendResult(success=False, error="image exceeds 10 MB LINE limit")
@@ -586,7 +648,7 @@ index 36df182..bbffc84 100644
              return SendResult(success=False, error="LINE adapter not connected")
          if not self.public_base_url and self.webhook_host == "0.0.0.0":
              return SendResult(
-@@ -1724,7 +1976,7 @@ class LineAdapter(BasePlatformAdapter):
+@@ -1724,7 +2028,7 @@ class LineAdapter(BasePlatformAdapter):
              return SendResult(success=False, error=f"audio file not found: {audio_path}")
          if path.stat().st_size > LINE_AV_MAX_BYTES:
              return SendResult(success=False, error="audio exceeds 200 MB LINE limit")
@@ -595,7 +657,7 @@ index 36df182..bbffc84 100644
              return SendResult(success=False, error="LINE adapter not connected")
          if not self.public_base_url and self.webhook_host == "0.0.0.0":
              return SendResult(
-@@ -1748,7 +2000,7 @@ class LineAdapter(BasePlatformAdapter):
+@@ -1748,7 +2052,7 @@ class LineAdapter(BasePlatformAdapter):
              return SendResult(success=False, error=f"video file not found: {video_path}")
          if path.stat().st_size > LINE_AV_MAX_BYTES:
              return SendResult(success=False, error="video exceeds 200 MB LINE limit")
@@ -604,7 +666,7 @@ index 36df182..bbffc84 100644
              return SendResult(success=False, error="LINE adapter not connected")
          if not self.public_base_url and self.webhook_host == "0.0.0.0":
              return SendResult(
-@@ -1787,8 +2039,14 @@ class LineAdapter(BasePlatformAdapter):
+@@ -1787,8 +2091,14 @@ class LineAdapter(BasePlatformAdapter):
          messages: List[Dict[str, Any]],
      ) -> SendResult:
          """Send already-built message objects, batched at 5/call."""
@@ -620,7 +682,7 @@ index 36df182..bbffc84 100644
          if not messages:
              return SendResult(success=True, message_id=None)
  
-@@ -1799,16 +2057,16 @@ class LineAdapter(BasePlatformAdapter):
+@@ -1799,16 +2109,16 @@ class LineAdapter(BasePlatformAdapter):
          token, used_reply = self._consume_reply_token(chat_id)
          if used_reply:
              try:
@@ -640,7 +702,7 @@ index 36df182..bbffc84 100644
              except Exception as exc:
                  return SendResult(success=False, error=str(exc))
  
-@@ -1817,7 +2075,7 @@ class LineAdapter(BasePlatformAdapter):
+@@ -1817,7 +2127,7 @@ class LineAdapter(BasePlatformAdapter):
              batch = rest[:LINE_MAX_MESSAGES_PER_CALL]
              rest = rest[LINE_MAX_MESSAGES_PER_CALL:]
              try:

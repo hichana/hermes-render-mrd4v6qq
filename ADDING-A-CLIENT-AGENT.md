@@ -96,36 +96,107 @@ easy way to inherit the same LLM provider key and toolset rather than
 re-entering them. Omit it for a fully bare profile if you'd rather start
 from scratch.)
 
-### The one landmine here, verified against the actual source
+You'll likely see `⚠ Could not create /root/.local/bin: [Errno 13]
+Permission denied` — harmless. That's the CLI trying to create
+`<name> <verb>` shell-alias wrapper scripts, which need root and fail
+under `s6-setuidgid hermes`. The profile itself is created fine regardless
+(confirmed by the "Next steps" output that follows); this guide never
+uses those aliases anyway, only explicit `hermes -p <name> ...`/SSH
+commands.
 
-`--clone` copies the **whole** `.env`, including `LINE_CHANNEL_ACCESS_TOKEN`
-and `LINE_CHANNEL_SECRET` if the profile you cloned from has LINE
-configured via env vars — which `default` does on this instance (its
-LINE config has always been pure `.env`, no `platforms.line` block in
-`config.yaml` at all). If those two keys land in the **new** profile's
-own `.env`, the gateway's port-binding check
-(`gateway/run.py::_start_one_profile_adapters`, reads that profile's
-`config.yaml` **as resolved through its own env**, so this really is
-driven by the cloned `.env`, not a `platforms:` block you'd have to add
-by hand) sees LINE as "enabled" for that profile and raises
-`SecondaryPortBindingConfigError` — which **skips starting every
-adapter for that profile, silently**, logging only one `WARNING` line.
-The profile exists, looks fine in `hermes profile list`, and simply never
-appears in `served_profiles` after a restart. Nothing in the dashboard
-flags this.
+### The landmine here — confirmed live, twice, on 2026-08-02
 
-**Fix, immediately after `--clone`, before ever restarting the gateway:**
+**Upstream issue [#50051](https://github.com/NousResearch/hermes-agent/issues/50051) is real on this pinned tag, and it will bite you here.**
+An earlier pass at this guide read `gateway/run.py::_profile_runtime_scope`'s
+docstring, saw it explicitly claims secondary-profile config resolution
+never falls through to the process-global `os.environ`, and concluded the
+env-leak class of bug this issue describes was probably fixed. **That
+conclusion was wrong**, verified by actually creating a profile and
+watching it fail twice in a row:
+
+- `_profile_runtime_scope`'s claim is true for `get_secret()`-based code.
+- It is **not** true for `gateway/config.py`'s registry-driven
+  platform-enablement loop, which calls each plugin's
+  `env_enablement_fn`/`is_connected` — and LINE's (and most other
+  built-in adapters') implementation of those reads `os.getenv(...)`
+  **directly**, unscoped. Since Hermes loads the *default* profile's
+  `.env` into the real process environment at gateway startup (`override=
+  True`) and never clears it, `LINE_CHANNEL_ACCESS_TOKEN`/`SECRET` (and
+  `TELEGRAM_BOT_TOKEN`, and almost certainly any other platform's
+  credential env var) stay visible to **every** profile's config
+  resolution for the life of the process — regardless of what is or isn't
+  in that profile's own `.env`.
+
+Concretely, what this does: `gateway/run.py::_start_one_profile_adapters`
+sees LINE as "enabled" for the new profile purely because the *default*
+profile's credentials are sitting in `os.environ`, raises
+`SecondaryPortBindingConfigError`, and **skips starting every adapter for
+that profile, silently** — one `WARNING` line in `/opt/data/logs/
+gateway.log`, nothing in `hermes profile list`, nothing in the dashboard,
+and the profile simply never appears in `served_profiles`. Stripping the
+credential vars from the *new* profile's own `.env` (below) does **not**
+fix this on its own — confirmed live: `ask-ngraph`'s `.env` had zero LINE
+vars and it still got skipped, because the leak comes from the *default*
+profile's env, not the new profile's file. The same mechanism did the
+identical thing to Telegram a restart later (`✗ telegram failed to
+connect (profile: ask-ngraph)`), for the same reason.
+
+**The actual fix — do this, not just the `.env` strip:** explicitly
+disable, in the **new** profile's own `config.yaml`, every platform the
+*default* profile has enabled (check `/opt/data/.env` — on this instance,
+that's `line` and `telegram`):
 
 ```bash
-/command/s6-setuidgid hermes sed -i '/^LINE_CHANNEL_ACCESS_TOKEN=/d;/^LINE_CHANNEL_SECRET=/d' \
+/command/s6-setuidgid hermes sh -c "cat >> /opt/data/profiles/<name>/config.yaml <<'YAMLEOF'
+platforms:
+  line:
+    enabled: false
+  telegram:
+    enabled: false
+YAMLEOF"
+```
+
+This works because `gateway/config.py`'s enablement loop checks for an
+**explicit** `enabled: false` in config.yaml *before* it ever calls
+`env_enablement_fn`/`is_connected` — an explicit false short-circuits the
+whole env-leak path, it doesn't just outrun it. (List whichever platforms
+the profile you cloned from actually has enabled — check
+`/opt/data/.env` for that instance's real set, `line`/`telegram` is just
+what this instance has.) Validate and restart exactly as Step 4 below,
+then re-check `served_profiles` and the gateway log for
+`SecondaryPortBindingConfigError`/`failed to connect (profile: <name>)`
+— **that**, not the `.env` strip alone, is the real verification.
+
+**Still do the `.env` strip too**, as defense in depth and because it's
+what stops the new profile from ever being *tempted* to reuse the
+default's credentials if the explicit-disable block is ever accidentally
+removed later:
+
+```bash
+/command/s6-setuidgid hermes sed -i \
+  -e '/^LINE_CHANNEL_ACCESS_TOKEN=/d' \
+  -e '/^LINE_CHANNEL_SECRET=/d' \
+  -e '/^TELEGRAM_BOT_TOKEN=/d' \
+  -e '/^TELEGRAM_ALLOWED_USERS=/d' \
+  -e '/^TELEGRAM_HOME_CHANNEL=/d' \
+  -e '/^TELEGRAM_HOME_CHANNEL_THREAD_ID=/d' \
   /opt/data/profiles/<name>/.env
 ```
 
-(Same for any *other* port-binding platform's required env vars if the
-profile you cloned from has one configured — `WHATSAPP_CLOUD_*`,
-`MSGRAPH_WEBHOOK_*`, etc. LINE is almost certainly the only one on this
-instance, but check `grep -E '^[A-Z_]+_(TOKEN|SECRET|KEY)=' /opt/data/.env`
-against `gateway/config.py`'s `PORT_BINDING_PLATFORM_VALUES` if unsure.)
+(Same idea for any *other* port-binding or polling platform's required
+env vars the profile you cloned from has configured — `WHATSAPP_CLOUD_*`,
+`MSGRAPH_WEBHOOK_*`, `DISCORD_BOT_TOKEN`, etc. Check
+`grep -oE '^[A-Z_]+=' /opt/data/profiles/<name>/.env` against whatever's
+actually enabled on the profile you cloned from.)
+
+The rest of the cloned `.env` (`OPENROUTER_API_KEY`, `BROWSERBASE_*`,
+tool-debug flags) is exactly what you want kept — that's the point of
+`--clone`. `LINE_BASIC_ID` and the other non-credential `LINE_*` vars
+left behind are harmless clutter once the credential vars above are gone
+— except `LINE_BASIC_ID` specifically, which is still the *default*
+channel's value at this point. Update it to this new channel's own Basic
+ID (Step 1.5) if this business wants the `line-invite` skill to work
+correctly under this profile.
 
 This LINE channel's own credentials belong **only** in the default
 profile's `config.yaml` `channels` entry (Step 4) — the new profile
@@ -136,20 +207,6 @@ the default profile's one `LineAdapter` instance, which stamps
 `source.profile` in software (`plans/line-multi-channel-plan.md`'s core
 mechanism) rather than routing at the platform-adapter level the way
 Telegram/Discord secondary profiles do.
-
-**Why this is a smaller risk than it sounds, but not zero**: upstream's
-own `_profile_runtime_scope`/`agent.secret_scope.build_profile_secret_scope`
-mechanism (`gateway/run.py`, read directly on this pinned tag) exists
-specifically so a secondary profile's config resolution reads *that
-profile's own* `.env` and never falls through to the process-global
-`os.environ` — the exact class of cross-profile env leak upstream issue
-[#50051](https://github.com/NousResearch/hermes-agent/issues/50051)
-described appears to be fixed by this mechanism on `v2026.7.20`. That
-means the *default* profile's own LINE credentials sitting in
-`/opt/data/.env` do **not** leak into the new profile's enablement check
-— the risk above is specifically and only about what a `--clone` copies
-into the *new* profile's own file. Still worth the Step 5 verification
-below rather than trusting this from reading code alone.
 
 ### Configure the new agent
 
@@ -201,7 +258,7 @@ isn't (and can't be) represented in this `channels` list — see
 Validate the YAML before restarting anything:
 
 ```bash
-/command/s6-setuidgid hermes python3 -c "import yaml; yaml.safe_load(open('/opt/data/config.yaml'))" \
+/command/s6-setuidgid hermes /opt/hermes/.venv/bin/python3 -c "import yaml; yaml.safe_load(open('/opt/data/config.yaml'))" \
   && echo "YAML OK"
 ```
 
@@ -227,9 +284,13 @@ ssh -i ~/.ssh/render_hermes srv-d97k2t57vvec73ccpg2g@ssh.oregon.render.com \
 ```
 
 `served_profiles` must include `<name>`. If it doesn't, check
-`/opt/data/logs/gateway.log` for `SecondaryPortBindingConfigError` or
-`MultiplexConfigError` mentioning that profile name — the fix is almost
-certainly Step 2's `.env` strip that didn't fully land.
+`/opt/data/logs/gateway.log` for `SecondaryPortBindingConfigError`,
+`MultiplexConfigError`, or `✗ <platform> failed to connect (profile:
+<name>)` mentioning that profile name — the fix is almost certainly
+Step 2's landmine section: the explicit `platforms: <name>: enabled:
+false` block is what actually matters (confirmed live, 2026-08-02 — the
+`.env` strip alone was not sufficient), so check that first, not just
+the `.env` contents.
 
 Also confirm the new route registered, from inside the container (LINE
 isn't reachable from outside until Step 6 sets the real webhook URL, but
@@ -279,7 +340,8 @@ API** tab → **Webhook settings**:
 
 | Symptom | Likely cause |
 |---|---|
-| New profile missing from `served_profiles` after restart | Step 2's landmine — port-binding env var(s) survived in the new profile's `.env`. Check `/opt/data/logs/gateway.log` for `SecondaryPortBindingConfigError`. |
+| New profile missing from `served_profiles` after restart, log shows `SecondaryPortBindingConfigError` | Step 2's landmine — the new profile's own `config.yaml` is missing the explicit `platforms: <platform>: enabled: false` block (the `.env` strip alone does not prevent this — confirmed live). |
+| Log shows `✗ <platform> failed to connect (profile: <name>)` but no `SecondaryPortBindingConfigError` | Same root cause, for a *polling* platform (Telegram, Discord, …) rather than a port-binding one — add `enabled: false` for that platform too. |
 | `/line/p/<name>/webhook/health` returns 404 | Same as above, or a typo in `profile:` (config.yaml) vs. the actual profile directory name — they must match byte-for-byte. |
 | LINE console's webhook verify fails, but the loopback health check (Step 5) passed | Public routing problem, not this patch — check `LINE_PUBLIC_URL`, Render's own reachability, Caddy logs. Not something this guide's steps would cause. |
 | New channel's messages get a reply, but it's the **default** agent's persona | The webhook URL in the LINE console (Step 6) is still pointing at `/line/webhook` instead of `/line/p/<name>/webhook` — a copy-paste of the default channel's URL. |

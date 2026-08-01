@@ -1,5 +1,5 @@
 diff --git a/tests/gateway/test_line_plugin.py b/tests/gateway/test_line_plugin.py
-index af207ce..24260eb 100644
+index af207ce..3fd2fb3 100644
 --- a/tests/gateway/test_line_plugin.py
 +++ b/tests/gateway/test_line_plugin.py
 @@ -25,6 +25,22 @@ import pytest
@@ -46,7 +46,7 @@ index af207ce..24260eb 100644
          token = adapter._invites.mint("Jamie", "Umanager")
  
          from gateway.pairing import PairingStore
-@@ -1047,3 +1068,446 @@ class TestDispatchEventInviteRedemption:
+@@ -1047,3 +1068,549 @@ class TestDispatchEventInviteRedemption:
  
          from gateway.pairing import PairingStore
          assert PairingStore().is_approved("line", "Ucandidate") is True
@@ -493,3 +493,106 @@ index af207ce..24260eb 100644
 +
 +        coder.client.push.assert_awaited_once()
 +        default.client.push.assert_not_awaited()
++
++
++class TestProfileAdapterRegistration:
++    """Regression coverage for a real bug found live on 2026-08-02: a
++    message on a non-default channel that needed a pairing-code reply
++    got no reply at all, silently. Root cause, traced in
++    gateway/authz_mixin.py: _authorization_adapter() looks for a LINE
++    adapter under runner._profile_adapters[<profile>][Platform.LINE] and
++    fails closed (returns None, no fallback to the default profile's
++    adapter) when nothing is registered there — which is always true for
++    a non-default LINE channel, since its own config.yaml has LINE
++    explicitly disabled (the #50051 workaround). connect() must register
++    the one shared adapter under each additional channel's own profile
++    key too; disconnect() must undo exactly that and nothing else."""
++
++    def _make_adapter(self, monkeypatch, **extra):
++        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "default-token")
++        monkeypatch.setenv("LINE_CHANNEL_SECRET", "default-secret")
++        from gateway.config import PlatformConfig
++        return LineAdapter(
++            PlatformConfig(
++                enabled=True,
++                extra={
++                    "channels": [
++                        {
++                            "profile": "coder",
++                            "channel_secret": "s",
++                            "channel_access_token": "t",
++                        }
++                    ],
++                    **extra,
++                },
++            )
++        )
++
++    def test_register_adds_the_adapter_under_each_non_default_channel(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch)
++        runner = MagicMock()
++        runner._profile_adapters = {}
++        adapter.gateway_runner = runner
++
++        adapter._register_in_profile_adapters()
++
++        assert runner._profile_adapters["coder"][adapter.platform] is adapter
++
++    def test_register_does_not_add_an_entry_for_the_default_channel(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch)
++        runner = MagicMock()
++        runner._profile_adapters = {}
++        adapter.gateway_runner = runner
++
++        adapter._register_in_profile_adapters()
++
++        assert "default" not in runner._profile_adapters
++
++    def test_register_is_a_safe_no_op_without_a_gateway_runner(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch)
++        adapter.gateway_runner = None
++        adapter._register_in_profile_adapters()  # must not raise
++
++    def test_register_is_a_safe_no_op_with_a_bare_runner(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch)
++        adapter.gateway_runner = MagicMock(spec=[])  # no _profile_adapters attr
++        adapter._register_in_profile_adapters()  # must not raise
++
++    def test_unregister_removes_exactly_what_was_added(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch)
++        runner = MagicMock()
++        runner._profile_adapters = {}
++        adapter.gateway_runner = runner
++        adapter._register_in_profile_adapters()
++
++        adapter._unregister_from_profile_adapters()
++
++        assert adapter.platform not in runner._profile_adapters.get("coder", {})
++
++    def test_unregister_does_not_remove_a_different_adapters_entry(self, monkeypatch):
++        # A different platform's adapter (or, hypothetically, a stale
++        # entry from a previous instance) registered under the same
++        # profile key must survive this adapter's own unregister.
++        adapter = self._make_adapter(monkeypatch)
++        runner = MagicMock()
++        other_adapter = object()
++        from gateway.config import Platform
++        runner._profile_adapters = {"coder": {Platform("telegram"): other_adapter}}
++        adapter.gateway_runner = runner
++        adapter._register_in_profile_adapters()
++
++        adapter._unregister_from_profile_adapters()
++
++        assert runner._profile_adapters["coder"] == {Platform("telegram"): other_adapter}
++
++    def test_register_then_unregister_is_idempotent_and_safe(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch)
++        runner = MagicMock()
++        runner._profile_adapters = {}
++        adapter.gateway_runner = runner
++
++        adapter._register_in_profile_adapters()
++        adapter._unregister_from_profile_adapters()
++        adapter._unregister_from_profile_adapters()  # must not raise on the second call
++
++        assert runner._profile_adapters.get("coder", {}) == {}
