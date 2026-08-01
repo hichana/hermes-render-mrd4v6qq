@@ -1,5 +1,5 @@
 diff --git a/tests/gateway/test_line_plugin.py b/tests/gateway/test_line_plugin.py
-index af207ce..4fb3c5d 100644
+index af207ce..24260eb 100644
 --- a/tests/gateway/test_line_plugin.py
 +++ b/tests/gateway/test_line_plugin.py
 @@ -25,6 +25,22 @@ import pytest
@@ -46,7 +46,7 @@ index af207ce..4fb3c5d 100644
          token = adapter._invites.mint("Jamie", "Umanager")
  
          from gateway.pairing import PairingStore
-@@ -1047,3 +1068,385 @@ class TestDispatchEventInviteRedemption:
+@@ -1047,3 +1068,446 @@ class TestDispatchEventInviteRedemption:
  
          from gateway.pairing import PairingStore
          assert PairingStore().is_approved("line", "Ucandidate") is True
@@ -238,6 +238,67 @@ index af207ce..4fb3c5d 100644
 +        adapter.handle_message.assert_awaited_once()
 +        sent_event = adapter.handle_message.await_args.args[0]
 +        assert sent_event.source.profile == "coder"
++
++    def test_default_channel_does_not_stamp_a_profile(self, monkeypatch):
++        """Regression test for a real bug found live on 2026-08-02: an
++        already-approved user got re-issued a pairing code on the default
++        LINE channel after this patch shipped. Root cause, traced in
++        gateway/authz_mixin.py: _pairing_store_for() routes to a
++        per-profile PairingStore whenever source.profile is truthy AND
++        registered in self.pairing_stores — and the multiplexer's own
++        bootstrap unconditionally registers "default" there (served =
++        [active] + ...). Stamping the literal string "default" therefore
++        silently redirected every default-channel message to
++        PairingStore(profile="default") (empty, at
++        profiles/default/pairing/) instead of the real global store where
++        approvals actually live. source_obj.profile must stay unset (None)
++        for the default channel specifically — additional channels are
++        unaffected and must keep stamping their own profile."""
++        adapter = self._make_adapter(monkeypatch)
++        adapter._handle_message_event = LineAdapter._handle_message_event.__get__(adapter)
++        adapter.handle_message = AsyncMock()
++        default = adapter._channels.default()
++
++        event = {
++            "type": "message",
++            "source": {"type": "user", "userId": "Uapproved"},
++            "message": {"type": "text", "text": "hi"},
++            "replyToken": "rt-1",
++        }
++        token = line_multiplex.set_current(default)
++        try:
++            asyncio.run(adapter._dispatch_event(event))
++        finally:
++            line_multiplex.reset_current(token)
++
++        adapter.handle_message.assert_awaited_once()
++        sent_event = adapter.handle_message.await_args.args[0]
++        assert sent_event.source.profile is None
++
++    def test_default_channel_stamps_no_profile_even_with_other_channels_configured(self, monkeypatch):
++        # Same as above, but specifically with a second channel present —
++        # confirms the exclusion is keyed on "is this the default channel",
++        # not "is this the only channel".
++        adapter = self._make_adapter(monkeypatch)
++        assert len(adapter._channels) == 2  # default + coder, from _make_adapter
++        adapter._handle_message_event = LineAdapter._handle_message_event.__get__(adapter)
++        adapter.handle_message = AsyncMock()
++        default = adapter._channels.default()
++
++        event = {
++            "type": "message",
++            "source": {"type": "user", "userId": "Uapproved"},
++            "message": {"type": "text", "text": "hi"},
++            "replyToken": "rt-1",
++        }
++        token = line_multiplex.set_current(default)
++        try:
++            asyncio.run(adapter._dispatch_event(event))
++        finally:
++            line_multiplex.reset_current(token)
++
++        sent_event = adapter.handle_message.await_args.args[0]
++        assert sent_event.source.profile is None
 +
 +
 +class TestHandleWebhookMultiChannel:
