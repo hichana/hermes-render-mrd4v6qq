@@ -35,6 +35,33 @@ The `profiles/` directory is ephemeral for new profiles (created on first-boot i
 
 When you SSH in and explore the instance, everything under `/opt/data/` survives deploys. Everything under `/opt/hermes/` is ephemeral and gets rebuilt. The dashboard's file browser and all operator interactions read from `/opt/data/`; SSH access is required to see `/opt/hermes/`.
 
+### Deleting a profile safely
+
+**`hermes profile delete <name>` can leave an orphaned `s6-supervise` process behind, still running, with no service directory backing it.** Confirmed live on `ngraph-agent` (2026-08-01): the profile directory (`/opt/data/profiles/ngraph-agent/`) was gone and `/run/service/` no longer listed it, yet `ps` still showed `s6-supervise gateway-ngraph-agent` plus its log supervisor and `s6-log` child, running indefinitely with an empty log file — i.e. the actual gateway process for that profile never even started, only the supervision tree leaked.
+
+**Root cause:** upstream's own teardown (`hermes_cli/service_manager.py`, `S6ServiceManager.unregister_profile_gateway`) does this in order — `s6-svc -d` (stop), `s6-svwait -D` (wait up to 10s for down), `s6-svscanctl -an` (tell s6-svscan to reap the now-orphaned supervisor), a **fixed 200ms sleep**, then `shutil.rmtree(svc_dir, ignore_errors=True)`. The 200ms is a guess, not a confirmation that the reap actually completed — under load, or just unluckily, `rmtree` can win the race and delete the directory before s6-svscan has dropped the supervisor. Once that happens, there's no comeback: the supervisor's control FIFO lived inside the now-deleted directory, so the normal `s6-svc` protocol has nothing left to write to. The whole thing is silent — `unregister_profile_gateway` swallows failures with `ignore_errors=True` and bare `except Exception: print(...)` at the call site, so nothing logs or errors when this happens.
+
+**Detecting it:** compare running gateway processes against registered service directories —
+
+```bash
+ps -eo pid,ppid,etime,args | grep -E "gateway run|caddy run" | grep -v grep   # what's actually running
+ls /run/service/                                                              # what s6 currently knows about
+```
+
+A `s6-supervise gateway-<profile>` process for a profile that's *not* in `/run/service/` (or a profile whose `/opt/data/profiles/<profile>/` is already gone) is this leak. Its log file (`/opt/data/logs/gateways/<profile>/current`) being empty confirms the actual gateway process never ran — you're only cleaning up the supervision scaffolding, not a live client-facing process.
+
+**Cleaning it up needs two non-obvious workarounds, both learned the hard way:**
+1. **`kill -TERM`/`kill -INT` are no-ops.** `s6-supervise` deliberately ignores common termination signals by design — it only reacts to commands written to its own control FIFO (the `s6-svc` protocol), which no longer exists once the directory is gone. Use `kill -9` (unmaskable) instead.
+2. **Root can't always `kill -9` either.** Render strips `CAP_KILL` from the container (see "Env-var changes need a *verified* restart" above) — even as root (uid 0), you can only signal processes owned by your own uid. The orphaned `s6-supervise` processes themselves are root-owned (kill directly), but their `s6-log` child runs as `hermes` — signal it via `/command/s6-setuidgid hermes kill -9 <pid>` (full path required; not on an interactive SSH shell's `PATH`).
+
+```bash
+# example, pids found via the detection step above
+kill -9 <supervisor-pid> <log-supervisor-pid>                 # root-owned
+/command/s6-setuidgid hermes kill -9 <s6-log-pid>              # hermes-owned
+```
+
+Verify by re-running the detection commands above — the profile's `s6-supervise`/`s6-log` processes should be gone, and `gateway-default`/`caddy` should be untouched throughout (they're a separate supervision tree; nothing above should ever be run against them).
+
 Our intention is for one logical agent to exist on a Render server deployment, with multiple agents able to be provisioned by us for a given business.
 
 Each agent needs:

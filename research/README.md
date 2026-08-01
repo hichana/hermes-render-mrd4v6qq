@@ -16,6 +16,8 @@
 | [`04-options-matrix.md`](04-options-matrix.md) | Five real options scored against our four requirements |
 | [`05-rebuild-sketch.md`](05-rebuild-sketch.md) | What a rebuild concretely costs, what we'd lose, phased plan |
 | [`06-recommendation.md`](06-recommendation.md) | The call, the reasoning, and the triggers that would change it |
+| [`07-line-multi-channel-multiplexing.md`](07-line-multi-channel-multiplexing.md) | Separate follow-up question (2026-08-01): can `gateway.multiplex_profiles` give each client agent its own LINE channel? Not as shipped — source-verified. Given our single-container Render deployment can't absorb N separate gateway processes (measured: ~262 MB RSS per idle gateway process against a 2 GiB container), recommendation is to patch LINE for real multi-channel support rather than sidestep multiplexing. |
+| [`08-line-multi-channel-patch-scope.md`](08-line-multi-channel-patch-scope.md) | Concrete scope for that patch: a `SessionSource.profile`-stamping mechanism the multiplexer already provides generically turns out to do most of the hard work, so the patch can follow `line-group-mention.patch`'s thin-call-outs-plus-testable-module shape rather than a full adapter rewrite. Includes exactly what changes in `UPGRADING.md`'s preflight manifest, smoke test, and Phase 5 checklist once this patch exists. |
 
 ## Inputs that shaped the analysis
 
