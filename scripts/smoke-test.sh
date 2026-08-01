@@ -193,4 +193,89 @@ echo "  ok: line-invite skill dependencies importable"
 # which upserts a live, provisioned Render instance over real SSH — out of
 # scope for this local Docker boot smoke test.
 
-echo "PASS: image boots, gateway running, Caddy routing, auth armed, LINE patches live, boot config patched"
+# 10. Multi-channel LINE routing (line-multi-channel.patch,
+#     plans/line-multi-channel-plan.md). Same reasoning as checks 6/7: LINE
+#     isn't configured in this boot, so an import-time break in the patch
+#     would otherwise stay invisible until it broke a live client's second
+#     channel. Goes one step further than 6/7 by actually constructing a
+#     multi-channel LineAdapter and driving _handle_webhook with real HMAC
+#     signatures — against the actual image this Dockerfile produces, not
+#     just the unit/integration test suite's own throwaway containers — to
+#     prove the single property that matters most here: a payload signed
+#     with one channel's secret must be rejected on a different channel's
+#     route.
+docker exec "${CONTAINER}" test -f /opt/hermes/plugins/platforms/line/line_multiplex.py \
+  || fail "line_multiplex.py is missing from the image — multi-channel routing would fail at import"
+docker exec "${CONTAINER}" grep -q "_channel_for_send" \
+  /opt/hermes/plugins/platforms/line/adapter.py \
+  || fail "adapter.py has no _channel_for_send call-outs — line-multi-channel.patch did not apply"
+docker exec "${CONTAINER}" /opt/hermes/.venv/bin/python3 - <<'PYEOF' \
+  || fail "multi-channel LINE routing is broken in the built image — see output above"
+import asyncio, base64, hashlib, hmac
+
+from aiohttp import streams
+from aiohttp.base_protocol import BaseProtocol
+from aiohttp.test_utils import make_mocked_request
+
+from gateway.config import PlatformConfig
+from plugins.platforms.line.adapter import LineAdapter
+
+def sign(body, secret):
+    digest = hmac.new(secret.encode(), body, hashlib.sha256).digest()
+    return base64.b64encode(digest).decode()
+
+async def mocked_request(path, body, signature):
+    loop = asyncio.get_running_loop()
+    payload = streams.StreamReader(BaseProtocol(loop=loop), 2**16, loop=loop)
+    payload.feed_data(body)
+    payload.feed_eof()
+    return make_mocked_request(
+        "POST", path, headers={"X-Line-Signature": signature}, payload=payload
+    )
+
+async def main():
+    import os
+    os.environ["LINE_CHANNEL_ACCESS_TOKEN"] = "default-token"
+    os.environ["LINE_CHANNEL_SECRET"] = "default-secret"
+    adapter = LineAdapter(PlatformConfig(enabled=True, extra={
+        "channels": [{
+            "profile": "smoke-second",
+            "channel_secret": "second-secret",
+            "channel_access_token": "second-token",
+        }],
+    }))
+    adapter._dispatch_event = lambda event: asyncio.sleep(0)
+
+    assert len(adapter._channels) == 2, "expected exactly 2 channels"
+    assert adapter._channels.by_webhook_path("/line/webhook") is adapter._channels.default()
+    assert adapter._channels.by_webhook_path("/line/p/smoke-second/webhook") is not None
+
+    body = b'{"events": []}'
+
+    resp = await adapter._handle_webhook(
+        await mocked_request("/line/webhook", body, sign(body, "default-secret"))
+    )
+    assert resp.status == 200, f"default channel's own signature rejected: {resp.status}"
+
+    resp = await adapter._handle_webhook(
+        await mocked_request("/line/p/smoke-second/webhook", body, sign(body, "second-secret"))
+    )
+    assert resp.status == 200, f"second channel's own signature rejected: {resp.status}"
+
+    resp = await adapter._handle_webhook(
+        await mocked_request("/line/webhook", body, sign(body, "second-secret"))
+    )
+    assert resp.status == 401, f"CROSS-CHANNEL SIGNATURE ACCEPTED on default route: {resp.status}"
+
+    resp = await adapter._handle_webhook(
+        await mocked_request("/line/p/smoke-second/webhook", body, sign(body, "default-secret"))
+    )
+    assert resp.status == 401, f"CROSS-CHANNEL SIGNATURE ACCEPTED on second-channel route: {resp.status}"
+
+    print("multi-channel routing + cross-channel signature isolation OK")
+
+asyncio.run(main())
+PYEOF
+echo "  ok: multi-channel routing + cross-channel signature isolation verified live in the built image"
+
+echo "PASS: image boots, gateway running, Caddy routing, auth armed, LINE patches live (incl. multi-channel), boot config patched"

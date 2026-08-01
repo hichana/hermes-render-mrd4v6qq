@@ -47,13 +47,25 @@ RUN apt-get update \
 # plugin package — a plain COPY, no `git apply` — so upstream drift can only
 # break the ~20 lines of call-outs in line-group-mention.patch, and it breaks
 # them loudly here at build time. Order matters: line-group-mention.patch is
-# generated against a tree that already has line-dm-pairing.patch applied.
+# generated against a tree that already has line-dm-pairing.patch applied,
+# and line-multi-channel.patch against a tree with both already applied.
+#
+# line-multi-channel.patch (plans/line-multi-channel-plan.md) lets this same
+# gateway process serve more than one LINE channel (distinct Developers
+# Console bot registrations, one per client agent), configured via
+# `platforms.line.extra.channels` — see modules/line/line_multiplex.py's own
+# docstring for the design. Same split as render_mention: the substantive
+# logic (credential/routing resolution) lives in a testable sibling module,
+# the patch is thin call-outs.
 COPY modules/line/render_mention.py /opt/hermes/plugins/platforms/line/render_mention.py
+COPY modules/line/line_multiplex.py /opt/hermes/plugins/platforms/line/line_multiplex.py
 COPY patches/line-dm-pairing.patch /tmp/line-dm-pairing.patch
 COPY patches/line-group-mention.patch /tmp/line-group-mention.patch
+COPY patches/line-multi-channel.patch /tmp/line-multi-channel.patch
 RUN cd /opt/hermes && git apply -p1 --verbose /tmp/line-dm-pairing.patch \
      && git apply -p1 --verbose /tmp/line-group-mention.patch \
-     && rm /tmp/line-dm-pairing.patch /tmp/line-group-mention.patch
+     && git apply -p1 --verbose /tmp/line-multi-channel.patch \
+     && rm /tmp/line-dm-pairing.patch /tmp/line-group-mention.patch /tmp/line-multi-channel.patch
 
 # The dashboard runs as `hermes`, but ui-tui/ and node_modules/ still ship
 # root-owned (upstream #20500). Without this the Chat tab's runtime esbuild

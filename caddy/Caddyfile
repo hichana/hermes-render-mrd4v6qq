@@ -20,6 +20,14 @@
 #   GET  /line/media/<token>/<filename>    media served to LINE
 # That last one is why LINE_PUBLIC_URL works: LINE's API takes HTTPS URLs,
 # not binary uploads, and it fetches them back through this proxy.
+#
+# Multi-channel LINE (line-multi-channel.patch, plans/line-multi-channel-plan.md)
+# needed NO change here. Additional channels register at
+# /line/p/<profile>/webhook — deliberately chosen to stay under this same
+# /line/* prefix (see line_multiplex.py's docstring) rather than mirroring
+# Hermes' own /p/<profile>/... convention for its shared webhook/api_server
+# listener, which LINE has never participated in. Don't add a separate /p/*
+# rule for this — it would duplicate or conflict with the one above.
 {
 	# No admin API — nothing in this container drives Caddy at runtime, and
 	# it would otherwise listen on :2019.

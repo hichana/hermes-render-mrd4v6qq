@@ -1,0 +1,434 @@
+diff --git a/tests/gateway/test_line_plugin.py b/tests/gateway/test_line_plugin.py
+index af207ce..4fb3c5d 100644
+--- a/tests/gateway/test_line_plugin.py
++++ b/tests/gateway/test_line_plugin.py
+@@ -25,6 +25,22 @@ import pytest
+ 
+ from tests.gateway._plugin_adapter_loader import load_plugin_adapter
+ 
++# Import the real `plugins.platforms.line` package once, fully, BEFORE the
++# isolated-name load below. adapter.py imports its sibling modules
++# (render_mention, line_multiplex) via `from plugins.platforms.line import
++# X` — if load_plugin_adapter("line") is the first thing to ever touch
++# `plugins.platforms.line` in this process, that import statement runs
++# while the package is still mid-__init__ (which itself does `from .adapter
++# import register`), and Python raises "cannot import name X from
++# partially initialized module". Pre-importing the package normally here
++# finishes that initialization first, so the isolated load below sees an
++# already-complete package and the sibling imports resolve as plain
++# attribute lookups. Harmless: it just means `plugins.platforms.line.adapter`
++# and the `plugin_adapter_line`-named module below end up as two distinct
++# module objects, exactly as this loader already documents for every other
++# plugin's adapter.py.
++import plugins.platforms.line  # noqa: F401
++
+ # Load plugins/platforms/line/adapter.py under plugin_adapter_line so it
+ # cannot collide with sibling platform-plugin tests in the same xdist worker.
+ _line = load_plugin_adapter("line")
+@@ -46,6 +62,7 @@ _standalone_send = _line._standalone_send
+ _env_enablement = _line._env_enablement
+ _MessageDeduplicator = _line._MessageDeduplicator
+ LineInviteStore = _line.LineInviteStore
++line_multiplex = _line.line_multiplex
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -964,7 +981,11 @@ class TestDispatchEventInviteRedemption:
+         # column was just the ID again.
+         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+         adapter = self._make_adapter(monkeypatch)
+-        adapter._client = None  # no LINE profile lookup available
++        # No LINE profile lookup available: _client resolves via the
++        # per-request channel context (line_multiplex), which is unset
++        # here since this test drives _dispatch_event directly rather
++        # than through _handle_webhook — so adapter._client is already
++        # None, with nothing to assign.
+         token = adapter._invites.mint("Jamie", "Umanager")
+ 
+         from gateway.pairing import PairingStore
+@@ -1047,3 +1068,385 @@ class TestDispatchEventInviteRedemption:
+ 
+         from gateway.pairing import PairingStore
+         assert PairingStore().is_approved("line", "Ucandidate") is True
++
++
++# ---------------------------------------------------------------------------
++# 12. Multi-channel LINE routing (line_multiplex)
++# ---------------------------------------------------------------------------
++
++class TestAdapterChannelRegistryConstruction:
++    """The adapter's __init__ builds a line_multiplex.ChannelRegistry from
++    its own top-level env/extra fields plus platforms.line.extra.channels.
++    Every currently-live single-channel deployment configures no `channels`
++    at all — that path must produce a registry of exactly one channel and
++    remain byte-identical to the pre-multiplex adapter."""
++
++    def _make_adapter(self, monkeypatch, **extra):
++        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "default-token")
++        monkeypatch.setenv("LINE_CHANNEL_SECRET", "default-secret")
++        from gateway.config import PlatformConfig
++        return LineAdapter(PlatformConfig(enabled=True, extra=extra))
++
++    def test_no_channels_extra_produces_a_single_default_channel(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch)
++        assert len(adapter._channels) == 1
++        default = adapter._channels.default()
++        assert default.profile == "default"
++        assert default.channel_secret == "default-secret"
++        assert default.channel_access_token == "default-token"
++        assert default.webhook_path == "/line/webhook"
++
++    def test_additional_channel_is_registered_with_its_own_path(self, monkeypatch):
++        adapter = self._make_adapter(
++            monkeypatch,
++            channels=[
++                {
++                    "profile": "coder",
++                    "channel_secret": "coder-secret",
++                    "channel_access_token": "coder-token",
++                }
++            ],
++        )
++        assert len(adapter._channels) == 2
++        coder = adapter._channels.by_profile("coder")
++        assert coder is not None
++        assert coder.channel_secret == "coder-secret"
++        assert coder.webhook_path == "/line/p/coder/webhook"
++        # Default channel's route is unchanged — the whole point of the
++        # design (zero config change for every already-live instance's
++        # LINE console callback URL).
++        assert adapter._channels.default().webhook_path == "/line/webhook"
++
++    def test_allowlists_and_dm_policy_are_isolated_per_channel(self, monkeypatch):
++        monkeypatch.setenv("LINE_ALLOWED_USERS", "Udefault")
++        adapter = self._make_adapter(
++            monkeypatch,
++            dm_policy="pairing",
++            channels=[
++                {
++                    "profile": "coder",
++                    "channel_secret": "s",
++                    "channel_access_token": "t",
++                    "allowed_users": ["Ucoder"],
++                    "dm_policy": "allowlist",
++                }
++            ],
++        )
++        assert adapter._channels.default().allowed_users == {"Udefault"}
++        assert adapter._channels.default().dm_policy == "pairing"
++        coder = adapter._channels.by_profile("coder")
++        assert coder.allowed_users == {"Ucoder"}
++        assert coder.dm_policy == "allowlist"
++
++
++class TestDispatchEventMultiChannel:
++    """Exercises _dispatch_event's channel-aware additions: remembering
++    chat_id -> channel for outbound sends, per-channel self-echo
++    filtering, and the source.profile stamp in _handle_message_event —
++    without any of this affecting single-channel behavior, which the
++    existing TestDispatchEventDmPairing/TestDispatchEventInviteRedemption
++    classes above already cover running with no channel context at all."""
++
++    def _make_adapter(self, monkeypatch, **extra):
++        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "default-token")
++        monkeypatch.setenv("LINE_CHANNEL_SECRET", "default-secret")
++        from gateway.config import PlatformConfig
++        adapter = LineAdapter(
++            PlatformConfig(
++                enabled=True,
++                extra={
++                    "channels": [
++                        {
++                            "profile": "coder",
++                            "channel_secret": "coder-secret",
++                            "channel_access_token": "coder-token",
++                        }
++                    ],
++                    **extra,
++                },
++            )
++        )
++        adapter._handle_message_event = AsyncMock()
++        adapter._handle_postback_event = AsyncMock()
++        return adapter
++
++    def test_dispatch_within_a_channel_context_remembers_the_chat(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch)
++        coder = adapter._channels.by_profile("coder")
++        event = {
++            "type": "message",
++            "source": {"type": "user", "userId": "Ucandidate"},
++            "message": {"type": "text", "text": "hi"},
++        }
++        token = line_multiplex.set_current(coder)
++        try:
++            asyncio.run(adapter._dispatch_event(event))
++        finally:
++            line_multiplex.reset_current(token)
++        assert adapter._channels.channel_for_chat("Ucandidate") is coder
++
++    def test_dispatch_with_no_channel_context_does_not_crash_or_remember(self, monkeypatch):
++        # Backward-compat path: existing tests above call _dispatch_event
++        # directly with no _handle_webhook-set context at all.
++        adapter = self._make_adapter(monkeypatch)
++        event = {
++            "type": "message",
++            "source": {"type": "user", "userId": "Ucandidate"},
++            "message": {"type": "text", "text": "hi"},
++        }
++        asyncio.run(adapter._dispatch_event(event))
++        assert adapter._channels.channel_for_chat("Ucandidate") is None
++
++    def test_self_echo_filter_is_scoped_to_the_current_channel(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch)
++        default = adapter._channels.default()
++        coder = adapter._channels.by_profile("coder")
++        default.bot_user_id = "Ubot-default"
++        coder.bot_user_id = "Ubot-coder"
++
++        # The default channel's own bot id is filtered out under its own
++        # context...
++        event_from_default_bot = {
++            "type": "message",
++            "source": {"type": "user", "userId": "Ubot-default"},
++            "message": {"type": "text", "text": "hi"},
++        }
++        token = line_multiplex.set_current(default)
++        try:
++            asyncio.run(adapter._dispatch_event(event_from_default_bot))
++        finally:
++            line_multiplex.reset_current(token)
++        adapter._handle_message_event.assert_not_awaited()
++
++        # ...but does NOT filter coder's bot id, and coder's own bot id
++        # sent under coder's context IS filtered — no cross-channel bleed
++        # in either direction.
++        event_from_coder_bot_under_default_context = {
++            "type": "message",
++            "source": {"type": "user", "userId": "Ubot-coder"},
++            "message": {"type": "text", "text": "hi"},
++        }
++        token = line_multiplex.set_current(default)
++        try:
++            asyncio.run(adapter._dispatch_event(event_from_coder_bot_under_default_context))
++        finally:
++            line_multiplex.reset_current(token)
++        adapter._handle_message_event.assert_awaited_once()
++
++    def test_message_event_stamps_source_profile_from_the_current_channel(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch)
++        # Use the real _handle_message_event this time (not mocked) so the
++        # build_source()+profile-stamp interaction is actually exercised.
++        adapter._handle_message_event = LineAdapter._handle_message_event.__get__(adapter)
++        adapter.handle_message = AsyncMock()
++        coder = adapter._channels.by_profile("coder")
++
++        event = {
++            "type": "message",
++            "source": {"type": "user", "userId": "Ucandidate"},
++            "message": {"type": "text", "text": "hi"},
++            "replyToken": "rt-1",
++        }
++        token = line_multiplex.set_current(coder)
++        try:
++            asyncio.run(adapter._dispatch_event(event))
++        finally:
++            line_multiplex.reset_current(token)
++
++        adapter.handle_message.assert_awaited_once()
++        sent_event = adapter.handle_message.await_args.args[0]
++        assert sent_event.source.profile == "coder"
++
++
++class TestHandleWebhookMultiChannel:
++    """_handle_webhook resolves the concrete channel by matching
++    request.path against the registry, verifies the signature against
++    THAT channel's secret, and scopes the whole event batch's dispatch to
++    it via the line_multiplex contextvar. This is the property that
++    matters most: a payload signed with one channel's secret must never
++    be accepted on a different channel's route."""
++
++    def _make_adapter(self, monkeypatch):
++        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "default-token")
++        monkeypatch.setenv("LINE_CHANNEL_SECRET", "default-secret")
++        from gateway.config import PlatformConfig
++        adapter = LineAdapter(
++            PlatformConfig(
++                enabled=True,
++                extra={
++                    "channels": [
++                        {
++                            "profile": "coder",
++                            "channel_secret": "coder-secret",
++                            "channel_access_token": "coder-token",
++                        }
++                    ]
++                },
++            )
++        )
++        adapter._dispatch_event = AsyncMock()
++        return adapter
++
++    @staticmethod
++    def _sign(body: bytes, secret: str) -> str:
++        digest = hmac.new(secret.encode(), body, hashlib.sha256).digest()
++        return base64.b64encode(digest).decode()
++
++    @staticmethod
++    async def _mocked_request(path: str, body: bytes, signature: str):
++        # get_running_loop() (not get_event_loop()) so this only ever runs
++        # inside an already-running loop — needed because each test may
++        # call this helper more than once across separate asyncio.run()
++        # calls, and get_event_loop() raises once no loop is "current"
++        # after a prior asyncio.run() has closed its own.
++        from aiohttp import streams
++        from aiohttp.base_protocol import BaseProtocol
++        from aiohttp.test_utils import make_mocked_request
++
++        loop = asyncio.get_running_loop()
++        payload = streams.StreamReader(BaseProtocol(loop=loop), 2**16, loop=loop)
++        payload.feed_data(body)
++        payload.feed_eof()
++        return make_mocked_request(
++            "POST", path, headers={"X-Line-Signature": signature}, payload=payload
++        )
++
++    async def _post(self, adapter, path: str, body: bytes, signature: str):
++        req = await self._mocked_request(path, body, signature)
++        return await adapter._handle_webhook(req)
++
++    def test_default_channel_route_accepts_its_own_signature(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch)
++        body = b'{"events": []}'
++        resp = asyncio.run(self._post(adapter, "/line/webhook", body, self._sign(body, "default-secret")))
++        assert resp.status == 200
++
++    def test_additional_channel_route_accepts_its_own_signature(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch)
++        body = b'{"events": []}'
++        resp = asyncio.run(
++            self._post(adapter, "/line/p/coder/webhook", body, self._sign(body, "coder-secret"))
++        )
++        assert resp.status == 200
++
++    def test_cross_channel_signature_is_rejected_coder_secret_on_default_route(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch)
++        body = b'{"events": []}'
++        # Signed with coder's secret, POSTed to the DEFAULT channel's route.
++        resp = asyncio.run(self._post(adapter, "/line/webhook", body, self._sign(body, "coder-secret")))
++        assert resp.status == 401
++        adapter._dispatch_event.assert_not_awaited()
++
++    def test_cross_channel_signature_is_rejected_default_secret_on_coder_route(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch)
++        body = b'{"events": []}'
++        # Signed with the DEFAULT channel's secret, POSTed to coder's route.
++        resp = asyncio.run(
++            self._post(adapter, "/line/p/coder/webhook", body, self._sign(body, "default-secret"))
++        )
++        assert resp.status == 401
++        adapter._dispatch_event.assert_not_awaited()
++
++    def test_unknown_path_is_not_found_not_misrouted(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch)
++        body = b'{"events": []}'
++        resp = asyncio.run(
++            self._post(adapter, "/line/p/nonexistent/webhook", body, self._sign(body, "default-secret"))
++        )
++        assert resp.status == 404
++
++    def test_single_channel_deployment_backward_compat(self, monkeypatch):
++        # No `channels` extra at all — the overwhelming majority shape
++        # today. The unprefixed /line/webhook route must behave exactly
++        # as it did before this patch.
++        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "only-token")
++        monkeypatch.setenv("LINE_CHANNEL_SECRET", "only-secret")
++        from gateway.config import PlatformConfig
++        adapter = LineAdapter(PlatformConfig(enabled=True, extra={}))
++        adapter._dispatch_event = AsyncMock()
++
++        body = b'{"events": []}'
++
++        async def run_both():
++            good = await self._post(adapter, "/line/webhook", body, self._sign(body, "only-secret"))
++            bad = await self._post(adapter, "/line/webhook", body, self._sign(body, "wrong"))
++            return good, bad
++
++        good, bad = asyncio.run(run_both())
++        assert good.status == 200
++        assert bad.status == 401
++
++
++class TestSendPathChannelResolution:
++    """send()/_send_text_chunks() must resolve their channel via
++    self._channels.channel_for_chat(chat_id) — NOT the request-scoped
++    _client property — because BasePlatformAdapter.handle_message() spawns
++    a background task for the agent turn, so by the time send() runs, the
++    inbound request's contextvar context may no longer be current. This is
++    the single most important correctness property this patch adds; see
++    line_multiplex's module docstring."""
++
++    def _make_adapter(self, monkeypatch):
++        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "default-token")
++        monkeypatch.setenv("LINE_CHANNEL_SECRET", "default-secret")
++        from gateway.config import PlatformConfig
++        adapter = LineAdapter(
++            PlatformConfig(
++                enabled=True,
++                extra={
++                    "channels": [
++                        {
++                            "profile": "coder",
++                            "channel_secret": "coder-secret",
++                            "channel_access_token": "coder-token",
++                        }
++                    ]
++                },
++            )
++        )
++        adapter._channels.default().client = AsyncMock()
++        adapter._channels.by_profile("coder").client = AsyncMock()
++        return adapter
++
++    def test_send_with_no_context_and_unknown_chat_fails_cleanly(self, monkeypatch):
++        # Outside any request context (exactly like a background task) and
++        # to a chat_id this process has never seen inbound — the documented
++        # v1 limitation, not a crash.
++        adapter = self._make_adapter(monkeypatch)
++        result = asyncio.run(adapter.send("Uneverseen", "hello"))
++        assert result.success is False
++
++    def test_send_uses_the_remembered_channel_outside_any_context(self, monkeypatch):
++        # Simulates the real race this patch exists to close: the channel
++        # is remembered during inbound dispatch, then send() runs later
++        # with NO current() context at all (line_multiplex.current() is
++        # never set in this test) — exactly what a handle_message()
++        # background task looks like.
++        adapter = self._make_adapter(monkeypatch)
++        coder = adapter._channels.by_profile("coder")
++        adapter._channels.remember_chat("Ucandidate", coder)
++        assert line_multiplex.current() is None  # sanity: no context leaked in
++
++        asyncio.run(adapter.send("Ucandidate", "hello"))
++
++        coder.client.push.assert_awaited_once()
++        adapter._channels.default().client.push.assert_not_awaited()
++
++    def test_send_does_not_use_a_stale_contextvar_from_an_unrelated_channel(self, monkeypatch):
++        # If send() used self._client (the request-scoped property) instead
++        # of chat_id-based resolution, this would send coder's reply
++        # through whatever channel happened to be ambiently "current" —
++        # exactly the cross-channel bug this design prevents.
++        adapter = self._make_adapter(monkeypatch)
++        default = adapter._channels.default()
++        coder = adapter._channels.by_profile("coder")
++        adapter._channels.remember_chat("Ucandidate", coder)
++
++        token = line_multiplex.set_current(default)
++        try:
++            asyncio.run(adapter.send("Ucandidate", "hello"))
++        finally:
++            line_multiplex.reset_current(token)
++
++        coder.client.push.assert_awaited_once()
++        default.client.push.assert_not_awaited()

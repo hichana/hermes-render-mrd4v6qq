@@ -10,7 +10,9 @@ A single container runs both Hermes processes under [s6-overlay](https://github.
 
 > **Do not override the image's `ENTRYPOINT`.** Boot-time work belongs in an `/etc/cont-init.d/` hook. Overriding `ENTRYPOINT` is what broke the v2026.5.7 → v2026.7.7.2 upgrade: `/usr/bin/tini` had become a symlink to `/init`, so an old `tini -g -- ...` ENTRYPOINT resolved to `/init -g -- …`, s6 tried to run `-g` as the main program, and the boot failed — while the container stayed up and the health check kept passing. (As of v2026.7.20 `tini` is a real shim script forwarding to `/init` rather than that symlink; it has been redefined twice now, which is exactly why we don't depend on it.) Run [`scripts/smoke-test.sh`](scripts/smoke-test.sh) after any `HERMES_IMAGE` bump.
 
-Hermes also supports **one gateway process per profile**: each profile gets its own `/run/service/gateway-<name>` service, reconciled on every boot from that profile's `gateway_state.json` on the disk. Each runs with its own `HERMES_HOME` and its own `.env`, so per-profile settings (including port-binding platforms like LINE) stay independent. For our purposes, we will only run one agent/gateway per business. If a stray second profile ever does show up (e.g. from testing), see "[Deleting a profile safely](#deleting-a-profile-safely)" before removing it — `hermes profile delete` alone is not sufficient.
+Hermes also supports running multiple profiles from **one gateway process** via `gateway.multiplex_profiles: true` (source-verified against v0.19.0/v2026.7.20, see `plans/line-multi-channel-plan.md`) — a single `gateway-default` process serves every profile, resolving each inbound message's profile generically via `SessionSource.profile` (stamped by `gateway/run.py`'s `_profile_name_for_source`/`_resolve_profile_home_for_source`) rather than by running separate OS processes. **This corrects an earlier version of this doc**, which described "each profile gets its own gateway process on a separate port" — that is the *pre-multiplex* model; with multiplexing on (the case on this instance), there is exactly one `gateway-default` process regardless of profile count, and running N separate gateway processes was measured and ruled out on this deployment's memory budget (~262 MB RSS per idle gateway process against a 2 GiB container ceiling). For our purposes, we will only run one agent/gateway *process* per business, with that process optionally serving several client-facing agents. If a stray second profile's supervision scaffolding ever does show up (e.g. from testing), see "[Deleting a profile safely](#deleting-a-profile-safely)" before removing it — `hermes profile delete` alone is not sufficient.
+
+**One structural gap multiplexing does not close:** `gateway.multiplex_profiles` cannot give a secondary profile its own instance of a *port-binding* platform (LINE, WhatsApp Cloud, msgraph_webhook, feishu, wecom_callback, bluebubbles, sms, webhook, api_server) — `SecondaryPortBindingConfigError` (`gateway/run.py`) skips the whole profile if its own `config.yaml` enables one. `line-multi-channel.patch` (below, under "Adapters and patches") works around this specifically for LINE by letting several distinct LINE Developers Console channels share the one `LineAdapter` instance the default profile runs, routed by webhook path rather than by profile-level config.
 
 The disk holds everything that should survive a redeploy: API keys (`.env`), config (`config.yaml`), the FTS5 session database, installed skills, Honcho user models, agent memories, cron job definitions, and logs.
 
@@ -26,12 +28,12 @@ There's a single container filesystem here, not a VM with a separate OS inside i
   - **`profiles/`** — profile metadata directory (see below)
   - **`skills/`, `memories/`, `logs/`, etc.** — agent runtime state (installed skills, learned context, audit trails)
 
-**Multi-profile architecture:** When `gateway.multiplex_profiles: true` is set, each profile gets its own gateway process on a separate port with its own configuration. The default profile's main state lives directly in `/opt/data/`; additional profiles and their metadata live under `profiles/`:
+**Multi-profile architecture:** When `gateway.multiplex_profiles: true` is set, one gateway process serves every profile (see the correction above) — each profile still gets its own configuration and isolated `HERMES_HOME` scope, just not its own OS process or port. The default profile's main state lives directly in `/opt/data/`; additional profiles and their metadata live under `profiles/`:
 
 - **`profiles/default/`** — metadata for the default profile (e.g., `pairing/` for default-profile-specific access control)
 - **`profiles/<other>/`** — if additional profiles exist (e.g., `ngraph-agent/`), each gets its own directory tree here with its own `config.yaml`, `.env`, and `pairing/` state
 
-The `profiles/` directory is ephemeral for new profiles (created on first-boot if `gateway.multiplex_profiles` is enabled), but any state written there persists across restarts. Each profile runs independently: different ports, different configurations, different platform tokens, different access lists.
+The `profiles/` directory is ephemeral for new profiles (created on first-boot if `gateway.multiplex_profiles` is enabled), but any state written there persists across restarts. Each profile runs independently within the shared gateway process: different configurations, different platform tokens (subject to the port-binding-platform gap above), different access lists.
 
 When you SSH in and explore the instance, everything under `/opt/data/` survives deploys. Everything under `/opt/hermes/` is ephemeral and gets rebuilt. The dashboard's file browser and all operator interactions read from `/opt/data/`; SSH access is required to see `/opt/hermes/`.
 
@@ -112,10 +114,14 @@ Platform adapters (LINE, Discord, Slack, etc.) ship in the upstream `nousresearc
 **Currently patched:**
 - **`line-dm-pairing.patch`** — Enables LINE DM pairing (accepting unauthenticated DMs that upstream drops) and manager-initiated QR invite tokens. Modifies LINE adapter + plugin manifest.
 - **`line-group-mention.patch`** — Adds group/multi-person mention gating to LINE. Applied *after* `line-dm-pairing.patch` (order is load-bearing — the two patches touch overlapping files and depend on each other's context). Thin by design: only ~20 lines of call-outs to the substantive logic.
+- **`line-multi-channel.patch`** — Lets the single `LineAdapter` instance the default profile runs serve several distinct LINE Developers Console channels (each its own credentials, allowlists, `dm_policy`), routed by webhook path (`/line/webhook` for the default channel, `/line/p/<profile>/webhook` for each additional one) rather than by profile-level `config.yaml` — the workaround for the port-binding-platform gap noted above. Applied *after* both other LINE patches (same load-bearing-order rule, extended to three). See `plans/line-multi-channel-plan.md` and `modules/line/line_multiplex.py`'s docstring for the full design, including why outbound sends resolve their channel via a `chat_id -> channel` map rather than the request-scoped context that inbound routing uses (`BasePlatformAdapter.handle_message()` spawns a background task for the agent turn, so the inbound request's context isn't reliably still current by the time a reply is ready to send).
 
 **Additional customizations (not patches):**
 - **`modules/line/render_mention.py`** — The logic for mention gating, copied directly into the upstream plugin as a new sibling module. Kept separate from patches so it's unit-testable without cloning upstream (`tests/test_render_mention.py`).
+- **`modules/line/line_multiplex.py`** — The channel-registry/routing logic behind `line-multi-channel.patch`, same split and same reason (`tests/test_line_multiplex.py`).
 - **Skills** (e.g., `skills/line-invite/`) — New skills baked into the image and registered at boot via `scripts/patch-config.py` (Pattern 1) and a cont-init hook (Pattern 2), without patching.
+
+**`platforms.line.extra.channels`** — the config surface `line-multi-channel.patch` adds — is deliberately config.yaml-only, with no env-var equivalent (it's a structured list; every other LINE knob today is a scalar `.env` value). `scripts/patch-config.py` does **not** seed it (Pattern 1 is for values every instance should get identically; `channels` is real, differing-per-client business config carrying secrets, the opposite case), and `admin-tools/env-sync` does not manage it either as of this writing — provisioning an additional channel is a manual `config.yaml` edit via the dashboard's config editor or SSH until that tool is extended (tracked as deferred in `plans/line-multi-channel-plan.md`, Phase 5).
 
 See `UPGRADING.md` for the full bump procedure, and `patches/README.md` for patch regeneration once a bump is confirmed to need it.
 
@@ -260,7 +266,7 @@ The moving parts:
 3. **A boot wait loop** (90s ceiling) that polls `/api/status` *through Caddy on :10000*, so reaching `gateway_state: running` simultaneously proves the proxy's catch-all route works. It also bails early if the container has exited.
 4. **`docker exec`-based assertions** — the script runs commands *inside* the container (`curl`, `ps`, `grep`, `test -f`, and Python one-liners against Hermes' own venv) and checks their output or exit status. That's the whole trick: `docker exec` lets a plain shell script inspect live in-container state without SSH or a test framework.
 
-The ten checks, and the failure each exists to catch:
+The eleven checks, and the failure each exists to catch:
 
 | Check | Catches |
 | --- | --- |
@@ -274,6 +280,7 @@ The ten checks, and the failure each exists to catch:
 | `/opt/render-tools/skills-local` in `/opt/data/config.yaml` | The boot-time config patcher didn't run or didn't land — covers its shebang, PyYAML in Hermes' venv, and cont-init hook ordering all at once |
 | **No** `mcp.render.com` / `RENDER_MCP_API_KEY` in `/opt/data/config.yaml` | Something in the boot path registering Render account access on a client-facing agent — the inverse of the check above, and the inversion of "only admins manage Render resources" |
 | `LineInviteStore` + `qrcode` importable | Our patch didn't provide the class, or upstream dropped the `qrcode` dependency — otherwise discovered by a manager whose QR invite command fails |
+| Live multi-channel routing: two channels registered, each accepts only its own HMAC signature, cross-channel signatures rejected with 401 | `line-multi-channel.patch` didn't apply, an `ImportError`/`SYMBOL LOST`-class break in `line_multiplex.py`'s wiring, or — the one genuinely severe failure mode in this whole feature — a routing/isolation bug that would let one client channel's traffic reach (or forge into) a different channel's agent |
 
 Why so much of it asserts *state* rather than reading logs is Pattern 4 above: a swallowed exception or a failed privilege drop will still print a success-shaped log line. Several of these checks are specifically designed to be things `docker logs` cannot tell you.
 
@@ -281,10 +288,11 @@ Cost: about 33 seconds on a warm cache, plus a multi-GB base-image pull the firs
 
 ### The validation surface
 
-- `./scripts/smoke-test.sh` — builds and boots the image the way Render does, then asserts it stays up, the gateway reaches `running`, Caddy routes (including `/line/*` to the LINE backend), the dashboard auth gate is armed, the patched LINE adapter and mention-gate module import, `skills.external_dirs` landed in `config.yaml`, no Render MCP entry is present, and the `line-invite` skill's dependencies resolve. Requires Docker. Extend this file's assertions rather than adding a separate test runner for anything that only matters at boot.
+- `./scripts/smoke-test.sh` — builds and boots the image the way Render does, then asserts it stays up, the gateway reaches `running`, Caddy routes (including `/line/*` to the LINE backend), the dashboard auth gate is armed, the patched LINE adapter and mention-gate module import, `skills.external_dirs` landed in `config.yaml`, no Render MCP entry is present, the `line-invite` skill's dependencies resolve, and multi-channel LINE routing + cross-channel signature isolation hold live against the built image. Requires Docker. Extend this file's assertions rather than adding a separate test runner for anything that only matters at boot.
 - `./scripts/upgrade-preflight.sh <candidate-tag>` — read-only upstream drift check for a `HERMES_IMAGE` bump; no Docker, no clone, about a minute. Its `DEPS` / `SYMBOLS` / `STRUCTURE` tables are the maintained inventory of everything in this repo that reaches into upstream internals. See `UPGRADING.md`.
 - `python3 -m pytest tests/ -q` — unit tests that need neither a container nor an upstream clone:
   - `tests/test_render_mention.py` — the mention gate.
+  - `tests/test_line_multiplex.py` — the multi-channel registry/routing logic (`line_multiplex.py`): channel construction, webhook-path resolution, `chat_id -> channel` remembering, and contextvar isolation between concurrent requests.
   - `tests/test_upgrade_preflight.py` — the preflight script, driven end to end against a `file://` fixture tree via `PREFLIGHT_RAW_BASE`. The fixture is derived from the live `DEPS` table rather than restated, so adding a manifest entry can't break unrelated tests.
   - `tests/test_preflight_manifest_coverage.py` — guards the preflight's own blind spot (below).
 

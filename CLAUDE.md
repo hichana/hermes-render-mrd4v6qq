@@ -6,6 +6,8 @@ See ARCHITECTURE.md for notes on architecture, architectural patterns, environme
 
 See @UPGRADING.md before touching `ARG HERMES_IMAGE` in the Dockerfile. Bumping the upstream Hermes version is never a one-line change — start with `./scripts/upgrade-preflight.sh <new-tag>`.
 
+See @ADDING-A-CLIENT-AGENT.md before provisioning a second client-facing agent (a new Hermes profile + LINE channel) on an already-deployed container.
+
 ## About NGraph
 
 NGraph is a company that focuses on bespoke AI integrations for businesses primarily based in Fukui, Japan, tho it strives to address a much wider market. Our broader goal is to develop a SaaS offering spawned from our experience building solutions for businesses and supplant our integrations business with one that is more scaleable. 

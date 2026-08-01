@@ -61,7 +61,19 @@ CMD [ ]
     "docker/cont-init.d/02-reconcile-profiles": "#!/command/with-contenv sh\n",
     "hermes_constants.py": "def get_hermes_dir(new_subpath, old_name):\n    return None\n",
     "gateway/pairing.py": "class PairingStore:\n    def generate_code(self):\n        return None\n",
-    "gateway/platforms/base.py": "    def enforces_own_access_policy(self):\n        return False\n",
+    "gateway/platforms/base.py": (
+        "    def enforces_own_access_policy(self):\n"
+        "        return False\n"
+        "    def build_source(self, chat_id, **kwargs):\n"
+        "        return None\n"
+    ),
+    "gateway/session.py": "class SessionSource:\n    profile = None\n",
+    "gateway/status.py": (
+        "def acquire_scoped_lock(namespace, key):\n"
+        "    return True\n"
+        "def release_scoped_lock(namespace, key):\n"
+        "    return None\n"
+    ),
     "gateway/run.py": """\
 import signal
 def request_restart(self, *, detached=False, via_service=False):

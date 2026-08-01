@@ -4,10 +4,12 @@ Read @README.md in this directory before editing, generating, or reordering
 anything here. The three things that get broken by not reading it:
 
 1. **Order is load-bearing.** `line-group-mention.patch` is generated against a
-   tree that *already* has `line-dm-pairing.patch` applied. Both touch
-   `_handle_message_event` and `plugin.yaml`. Applied standalone against
-   pristine upstream, the mention patch fails "patch does not apply". Apply and
-   generate them in that order, always.
+   tree that *already* has `line-dm-pairing.patch` applied, and
+   `line-multi-channel.patch` against a tree with *both* already applied. All
+   three touch overlapping regions of `adapter.py`/`plugin.yaml`. Applied
+   standalone or out of order against pristine upstream, each later patch
+   fails "patch does not apply". Apply and generate them in that order,
+   always: dm-pairing → group-mention → multi-channel.
 
 2. **Never hand-edit hunk headers or context lines** to make a patch apply.
    Regenerate the patch from a real tree at the pinned tag (README's
@@ -22,5 +24,6 @@ anything here. The three things that get broken by not reading it:
    patch here as unverified — see `UPGRADING.md`, and start with
    `./scripts/upgrade-preflight.sh <tag>` rather than guessing.
 
-`line-dm-pairing.tests.patch` is **not** applied by the `Dockerfile` (the
-upstream image ships no `tests/`). Don't add a build step for it.
+`line-dm-pairing.tests.patch` and `line-multi-channel.tests.patch` are
+**not** applied by the `Dockerfile` (the upstream image ships no `tests/`).
+Don't add a build step for either.

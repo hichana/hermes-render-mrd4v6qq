@@ -40,8 +40,8 @@ DOCKERFILE="${PREFLIGHT_DOCKERFILE:-Dockerfile}"
 #
 # Format: <upstream-path>|<severity>|<what depends on it>
 DEPS=(
-  "plugins/platforms/line/adapter.py|blocker|patch target: line-dm-pairing.patch + line-group-mention.patch"
-  "plugins/platforms/line/plugin.yaml|blocker|patch target: both patches add optional_env entries"
+  "plugins/platforms/line/adapter.py|blocker|patch target: line-dm-pairing.patch + line-group-mention.patch + line-multi-channel.patch"
+  "plugins/platforms/line/plugin.yaml|blocker|patch target: all three patches add optional_env/extra-config entries"
   "docker/main-wrapper.sh|blocker|the ENTRYPOINT chain that runs our CMD and drops to hermes"
   "docker/s6-rc.d/user/contents.d/main-hermes|blocker|proves the s6 user bundle our caddy service registers into still exists"
   "docker/s6-rc.d/user/contents.d/dashboard|blocker|same bundle; also the dashboard Caddy proxies to"
@@ -50,12 +50,14 @@ DEPS=(
   "Dockerfile|review|upstream image shape: ENTRYPOINT, s6, ui-tui build, HERMES_HOME"
   "hermes_constants.py|review|get_hermes_dir(), imported by render_mention.py and LineInviteStore"
   "gateway/pairing.py|review|PairingStore + generate_code(), imported by line-dm-pairing.patch"
-  "gateway/platforms/base.py|review|enforces_own_access_policy, overridden by line-dm-pairing.patch"
+  "gateway/platforms/base.py|review|enforces_own_access_policy (line-dm-pairing.patch) + build_source() (line-multi-channel.patch's source.profile stamping mechanism)"
+  "gateway/session.py|review|SessionSource.profile field — the generic per-profile-scope mechanism line-multi-channel.patch's source.profile stamp relies on"
+  "gateway/status.py|review|acquire_scoped_lock()/release_scoped_lock() — line-multi-channel.patch's per-channel connect()/disconnect() locking"
   "gateway/run.py|review|the USR1 restart path admin-tools/env-sync verifies against"
   "hermes_cli/container_boot.py|review|profile reconciler; see HISTORICAL-GOTCHAS.md"
   "cli-config.yaml.example|review|documents the config defaults live instances inherit"
   "hermes_cli/config.py|review|DEFAULT_CONFIG — the defaults NOT documented in cli-config.yaml.example"
-  "tests/gateway/test_line_plugin.py|review|target of line-dm-pairing.tests.patch — not in the image, but re-verified against a clone during patch regeneration"
+  "tests/gateway/test_line_plugin.py|review|target of line-dm-pairing.tests.patch + line-multi-channel.tests.patch — not in the image, but re-verified against a clone during patch regeneration"
 )
 
 # Symbols our patches, modules and admin tooling import or signal by name. A
@@ -78,6 +80,10 @@ SYMBOLS=(
   "plugins/platforms/line/adapter.py|^class _LineClient\b|_LineClient (get_profile, invite patch)"
   "plugins/platforms/line/adapter.py|def _truthy_env\(|_truthy_env() (patch helper)"
   "plugins/platforms/line/adapter.py|def _allowed_for_source\(|_allowed_for_source() (patch helper)"
+  "gateway/session.py|^class SessionSource\b|class SessionSource (source.profile field)"
+  "gateway/platforms/base.py|def build_source\(|build_source() (multi-channel patch's profile-stamping anchor)"
+  "gateway/status.py|def acquire_scoped_lock\(|acquire_scoped_lock() (per-channel connect() lock)"
+  "gateway/status.py|def release_scoped_lock\(|release_scoped_lock() (per-channel disconnect() lock)"
 )
 
 # Shape assertions against the candidate's own Dockerfile. These are exactly

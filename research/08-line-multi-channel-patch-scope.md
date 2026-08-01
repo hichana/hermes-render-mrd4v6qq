@@ -6,6 +6,15 @@
 
 **Headline revision from `07`:** the effort estimate there was conservative. Reading the actual multiplexer plumbing in `gateway/run.py` and `gateway/platforms/base.py` turned up a mechanism that does almost all of the hard part for us — see "The load-bearing discovery" below. And by following `line-group-mention.patch`'s own proven shape (thin adapter call-outs, substantive logic in a testable sibling module), this can stay closer to that patch's size than to a from-scratch rewrite.
 
+> **Revised 2026-08-01 — built and locally validated as `patches/line-multi-channel.patch`.** `plans/line-multi-channel-plan.md` turned this scope into working code; two corrections against this doc's own sketch, both discovered while implementing (not anticipated here):
+>
+> 1. **The URL scheme.** This doc's `/p/{profile}/line/webhook` mirrors upstream's shared-listener convention (`webhook`/`api_server`). Checking the actual `caddy/Caddyfile` (`handle /line/* { ... }`, path-preserving) showed that scheme would silently misroute to the dashboard instead of the LINE backend — LINE has never used that shared-listener convention here. Shipped as `/line/p/{profile}/webhook` instead: stays under the existing Caddy rule, zero Caddyfile changes needed.
+> 2. **`_client`/credentials can't be plain contextvar-backed properties for everything.** This doc's sketch (below) is right for the *inbound* synchronous path, but `connect()` and every outbound send method (`send`, `send_image_file`, `send_voice`, `send_video`, `_send_messages`) needed their own explicit per-channel resolution instead — `BasePlatformAdapter.handle_message()` spawns a background task for the agent turn, so by the time a reply is sent, the inbound request's context may no longer be current. See `modules/line/line_multiplex.py`'s docstring for the `chat_id -> channel` map this required.
+>
+> Also found and fixed along the way, unrelated to the design itself: `tests/gateway/test_line_plugin.py` couldn't be collected via pytest at all once `adapter.py` gained *any* `from plugins.platforms.line import <sibling>` import — latent since `line-group-mention.patch` shipped, just never exercised. One-line fix in `patches/line-multi-channel.tests.patch`.
+>
+> The scope below is otherwise accurate and is kept as the design record — read it for the *why*, and the plan/patch for the as-built *what*.
+
 ---
 
 ## The load-bearing discovery

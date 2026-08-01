@@ -1,0 +1,662 @@
+diff --git a/plugins/platforms/line/adapter.py b/plugins/platforms/line/adapter.py
+index 36df182..c991343 100644
+--- a/plugins/platforms/line/adapter.py
++++ b/plugins/platforms/line/adapter.py
+@@ -97,6 +97,7 @@ from gateway.platforms.base import (
+ )
+ from gateway.config import Platform
+ from plugins.platforms.line import render_mention
++from plugins.platforms.line import line_multiplex
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -860,12 +861,12 @@ class LineAdapter(BasePlatformAdapter):
+ 
+         extra = getattr(config, "extra", {}) or {}
+ 
+-        # Credentials
+-        self.channel_access_token = (
++        # Default channel's credentials (env takes precedence, unchanged).
++        default_channel_access_token = (
+             os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+             or extra.get("channel_access_token", "")
+         )
+-        self.channel_secret = (
++        default_channel_secret = (
+             os.getenv("LINE_CHANNEL_SECRET")
+             or extra.get("channel_secret", "")
+         )
+@@ -888,29 +889,60 @@ class LineAdapter(BasePlatformAdapter):
+             or ""
+         ).rstrip("/")
+ 
+-        # Three-allowlist gating
+-        self.allow_all = _truthy_env(
++        # Default channel's three-allowlist gating.
++        default_allow_all = _truthy_env(
+             "LINE_ALLOW_ALL_USERS", bool(extra.get("allow_all_users", False))
+         )
+-        self.allowed_users = _csv_set(
++        default_allowed_users = _csv_set(
+             os.getenv("LINE_ALLOWED_USERS", "")
+         ) | set(extra.get("allowed_users", []))
+-        self.allowed_groups = _csv_set(
++        default_allowed_groups = _csv_set(
+             os.getenv("LINE_ALLOWED_GROUPS", "")
+         ) | set(extra.get("allowed_groups", []))
+-        self.allowed_rooms = _csv_set(
++        default_allowed_rooms = _csv_set(
+             os.getenv("LINE_ALLOWED_ROOMS", "")
+         ) | set(extra.get("allowed_rooms", []))
+ 
+-        # DM pairing policy — mirrors QQBot/Weixin/WhatsApp's dm_policy
+-        # switch. "pairing" (default) lets an unrecognized DM fall through
+-        # to the gateway's central pairing/authorization logic instead of
+-        # being dropped here; LINE_ALLOWED_USERS keeps working unchanged
+-        # as a separate, unioned grant.
+-        self._dm_policy = str(
++        # Default channel's DM pairing policy — mirrors QQBot/Weixin/
++        # WhatsApp's dm_policy switch. "pairing" (default) lets an
++        # unrecognized DM fall through to the gateway's central
++        # pairing/authorization logic instead of being dropped here;
++        # LINE_ALLOWED_USERS keeps working unchanged as a separate,
++        # unioned grant.
++        default_dm_policy = str(
+             extra.get("dm_policy") or os.getenv("LINE_DM_POLICY", "pairing")
+         ).strip().lower()
+ 
++        # Every LINE channel (Developers Console bot registration) this
++        # adapter instance serves — the default channel above, built from
++        # this adapter's own top-level env/extra fields, plus any
++        # additional channels declared in `platforms.line.extra.channels`
++        # (a structured config.yaml list — not representable in .env,
++        # unlike every other LINE knob today). A deployment with no
++        # `channels` configured (every currently-live instance) produces a
++        # registry of exactly one channel and is byte-identical to the
++        # pre-multiplex adapter in every respect: same webhook path, same
++        # signature check, same allowlists. See
++        # line_multiplex.ChannelRegistry.from_extra's docstring.
++        #
++        # `channel_secret`/`channel_access_token`/`allow_all`/
++        # `allowed_users`/`allowed_groups`/`allowed_rooms`/`_dm_policy` are
++        # deliberately NOT kept as scalar instance attributes below — every
++        # former read site either resolves the concrete channel directly
++        # (connect(), _handle_webhook) or runs inside a request whose
++        # channel is available via the properties defined after __init__.
++        self._channels = line_multiplex.ChannelRegistry.from_extra(
++            extra,
++            default_channel_secret=default_channel_secret,
++            default_channel_access_token=default_channel_access_token,
++            default_webhook_path=self.webhook_path,
++            default_allow_all=default_allow_all,
++            default_allowed_users=default_allowed_users,
++            default_allowed_groups=default_allowed_groups,
++            default_allowed_rooms=default_allowed_rooms,
++            default_dm_policy=default_dm_policy,
++        )
++
+         # Slow-LLM postback button threshold
+         try:
+             self.slow_response_threshold = float(
+@@ -951,15 +983,12 @@ class LineAdapter(BasePlatformAdapter):
+         self._mention_gate = render_mention.MentionGate()
+ 
+         # Runtime state
+-        self._client: Optional[_LineClient] = None
+         self._app = None  # aiohttp.web.Application
+         self._runner = None  # aiohttp.web.AppRunner
+         self._site = None  # aiohttp.web.TCPSite
+         self._reply_tokens: Dict[str, Tuple[str, float]] = {}  # chat_id → (token, expiry)
+         self._cache = RequestCache()
+         self._dedup = _MessageDeduplicator()
+-        self._bot_user_id: Optional[str] = None
+-        self._lock_key: Optional[str] = None
+ 
+         # Media state
+         self._media_tokens: Dict[str, Tuple[str, float]] = {}  # token → (path, expiry)
+@@ -975,6 +1004,122 @@ class LineAdapter(BasePlatformAdapter):
+         """LINE gates group/room access itself; DM access follows dm_policy."""
+         return True
+ 
++    # ------------------------------------------------------------------
++    # Multi-channel resolution
++    # ------------------------------------------------------------------
++    #
++    # These five properties resolve against `line_multiplex.current()` —
++    # the channel handling *this* inbound request, set by `_handle_webhook`
++    # for the duration of one webhook POST's event batch. They are safe
++    # anywhere in the synchronous inbound path (`_dispatch_event` and
++    # everything it calls directly: `_is_dm_intake_allowed`, the mention
++    # gate, invite redemption, media download, postback handling).
++    #
++    # `_client` below is the one that needs the most care: it is ALSO only
++    # safe on that same synchronous inbound path. It must NOT be used by
++    # any outbound send method (`send`, `send_image_file`, `send_voice`,
++    # `send_video`, `_send_messages`, `send_typing`, `_keep_typing`) —
++    # `BasePlatformAdapter.handle_message()` spawns a background task for
++    # the agent turn, so by the time a reply is ready to send, this
++    # request's context may no longer be current (or current at all, on
++    # whatever task ends up calling send()). Those methods resolve their
++    # channel explicitly via `self._channels.channel_for_chat(chat_id)`
++    # instead — see `line_multiplex`'s module docstring for the full
++    # reasoning. Reintroducing `self._client`/`self.allowed_users`/etc.
++    # into a send-path method is the one way to silently reopen the
++    # cross-channel bug this whole patch exists to prevent.
++
++    @property
++    def allow_all(self) -> bool:
++        channel = line_multiplex.current()
++        return (channel or self._channels.default()).allow_all
++
++    @property
++    def allowed_users(self) -> Set[str]:
++        channel = line_multiplex.current()
++        return (channel or self._channels.default()).allowed_users
++
++    @property
++    def allowed_groups(self) -> Set[str]:
++        channel = line_multiplex.current()
++        return (channel or self._channels.default()).allowed_groups
++
++    @property
++    def allowed_rooms(self) -> Set[str]:
++        channel = line_multiplex.current()
++        return (channel or self._channels.default()).allowed_rooms
++
++    @property
++    def _dm_policy(self) -> str:
++        channel = line_multiplex.current()
++        return (channel or self._channels.default()).dm_policy
++
++    @property
++    def channel_access_token(self) -> str:
++        """Read-only backward-compat alias for the current channel's
++        token, falling back to the default channel outside any request
++        context. Not read anywhere internally (connect() and _handle_webhook
++        resolve the concrete channel directly) — kept purely because
++        upstream's own test suite (``TestAdapterInit``) and potentially
++        other external code reads this attribute directly."""
++        channel = line_multiplex.current()
++        return (channel or self._channels.default()).channel_access_token
++
++    @property
++    def channel_secret(self) -> str:
++        """Read-only backward-compat alias — see ``channel_access_token``."""
++        channel = line_multiplex.current()
++        return (channel or self._channels.default()).channel_secret
++
++    @property
++    def _client(self) -> Optional["_LineClient"]:
++        # Falls back to the default channel outside any request context,
++        # consistent with allow_all/allowed_users/etc. above — this is
++        # what makes `adapter._client = mock; adapter._client.reply(...)`
++        # (upstream's own TestSendRouting fixture pattern, read
++        # immediately after assignment with no _handle_webhook context)
++        # keep working. Safe: every send-path method resolves its channel
++        # via `_channel_for_send`/explicit `channel.client`, never through
++        # this property — see the block comment above.
++        channel = line_multiplex.current()
++        return (channel or self._channels.default()).client
++
++    @_client.setter
++    def _client(self, value: Optional["_LineClient"]) -> None:
++        # Backward-compat: pre-multiplex code (including upstream's own
++        # TestSendRouting fixtures) assigns `adapter._client = mock`
++        # directly to stub out the one-and-only client. There's no
++        # ambiguity about which channel that means — assign it to the
++        # default channel, exactly what the old single scalar meant.
++        self._channels.default().client = value
++
++    def _channel_for_send(self, chat_id: str) -> Optional["line_multiplex.LineChannel"]:
++        """Resolve which channel owns an *outbound* send to ``chat_id``.
++
++        Used by every send-path method instead of the inbound-only
++        ``_client`` property — see the block comment above these
++        properties. ``channel_for_chat`` is a plain ``chat_id ->
++        LineChannel`` map recorded in ``_dispatch_event`` at inbound time;
++        falling back to ``line_multiplex.current()`` covers the (rarer)
++        case of a send that happens to still be inside the originating
++        request's context. If neither resolves and there is exactly one
++        configured channel, that channel is unambiguous (there is nothing
++        else it could be) and is used — this is what keeps every
++        single-channel deployment, and every pre-multiplex test that
++        stubs ``_client`` directly, byte-identical. With more than one
++        channel configured, an unresolved chat_id returns ``None`` rather
++        than guess — see the module docstring's "Known v1 limitation".
++        """
++        channel = self._channels.channel_for_chat(chat_id)
++        if channel is not None:
++            return channel
++        current = line_multiplex.current()
++        if current is not None:
++            return current
++        if len(self._channels) == 1:
++            return self._channels.default()
++        return None
++
+     def _is_dm_intake_allowed(self, user_id: str) -> bool:
+         """Whether an unrecognized DM may reach the gateway (pairing handshake path)."""
+         if self._dm_policy == "disabled":
+@@ -992,41 +1137,56 @@ class LineAdapter(BasePlatformAdapter):
+     # ------------------------------------------------------------------
+ 
+     async def connect(self, *, is_reconnect: bool = False) -> bool:
+-        if not self.channel_access_token or not self.channel_secret:
++        unconfigured = [ch.profile for ch in self._channels.all() if not ch.is_configured()]
++        if unconfigured:
+             self._set_fatal_error(
+                 "config_missing",
+-                "LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET must be set",
++                "LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET (or, for "
++                "an additional channel, its channels[].channel_access_token"
++                "/channel_secret in extra config) must be set for every "
++                f"configured channel; missing for: {', '.join(unconfigured)}",
+                 retryable=False,
+             )
+             return False
+ 
+-        # Prevent two profiles from running on the same channel access token.
++        # Prevent two profiles from running on the same channel access
++        # token — one lock per channel, so N channels means N independent
++        # locks, not one lock covering the whole adapter.
+         try:
+-            from gateway.status import acquire_scoped_lock
+-            # Use a hash of the token so we don't write the secret to disk.
+-            tok_hash = hashlib.sha256(self.channel_access_token.encode()).hexdigest()[:16]
+-            if not acquire_scoped_lock("line", tok_hash):
+-                self._set_fatal_error(
+-                    "lock_conflict",
+-                    "LINE channel already in use by another profile",
+-                    retryable=False,
+-                )
+-                return False
+-            self._lock_key = tok_hash
++            from gateway.status import acquire_scoped_lock, release_scoped_lock
++            locked: List["line_multiplex.LineChannel"] = []
++            for ch in self._channels.all():
++                # Use a hash of the token so we don't write the secret to disk.
++                tok_hash = hashlib.sha256(ch.channel_access_token.encode()).hexdigest()[:16]
++                if not acquire_scoped_lock("line", tok_hash):
++                    for prior in locked:
++                        try:
++                            release_scoped_lock("line", prior.lock_key)
++                        except Exception:
++                            pass
++                        prior.lock_key = None
++                    self._set_fatal_error(
++                        "lock_conflict",
++                        f"LINE channel already in use by another profile (profile={ch.profile!r})",
++                        retryable=False,
++                    )
++                    return False
++                ch.lock_key = tok_hash
++                locked.append(ch)
+         except ImportError:
+-            self._lock_key = None
+-
+-        self._client = _LineClient(self.channel_access_token)
++            pass
+ 
+-        # Best-effort: fetch our own bot userId for self-message filtering.
+-        # If the call fails (offline tests, transient 5xx) we fall back to
+-        # not filtering self-events; the cost is minor (LINE doesn't
+-        # actually echo our own messages back).
+-        try:
+-            self._bot_user_id = await self._client.get_bot_user_id()
+-        except Exception as exc:
+-            logger.debug("LINE: get_bot_user_id failed: %s", exc)
+-            self._bot_user_id = None
++        # Best-effort: fetch each channel's own bot userId for self-message
++        # filtering. If a call fails (offline tests, transient 5xx) that
++        # one channel falls back to not filtering self-events; the cost is
++        # minor (LINE doesn't actually echo our own messages back).
++        for ch in self._channels.all():
++            ch.client = _LineClient(ch.channel_access_token)
++            try:
++                ch.bot_user_id = await ch.client.get_bot_user_id()
++            except Exception as exc:
++                logger.debug("LINE: get_bot_user_id failed for profile %s: %s", ch.profile, exc)
++                ch.bot_user_id = None
+ 
+         # Spin up the aiohttp webhook server.
+         try:
+@@ -1040,9 +1200,17 @@ class LineAdapter(BasePlatformAdapter):
+             return False
+ 
+         self._app = web.Application(client_max_size=WEBHOOK_BODY_MAX_BYTES)
+-        self._app.router.add_post(self.webhook_path, self._handle_webhook)
+-        # Public health probe — useful for tunnel/proxy verification.
+-        self._app.router.add_get(f"{self.webhook_path}/health", self._handle_health)
++        # One route pair per channel — the default channel keeps today's
++        # unprefixed self.webhook_path unchanged (zero config change for
++        # every already-live single-channel instance's LINE console
++        # callback URL); every other channel gets its own profile-scoped
++        # path (see line_multiplex._webhook_path_for). _handle_webhook
++        # resolves which channel a given request is for by matching
++        # request.path back against the registry, not via a URL parameter.
++        for _ch in self._channels.all():
++            self._app.router.add_post(_ch.webhook_path, self._handle_webhook)
++            # Public health probe — useful for tunnel/proxy verification.
++            self._app.router.add_get(f"{_ch.webhook_path}/health", self._handle_health)
+         # Media serving endpoint.
+         self._app.router.add_get(
+             f"{DEFAULT_MEDIA_PATH_PREFIX}/{{token}}/{{filename}}",
+@@ -1064,10 +1232,11 @@ class LineAdapter(BasePlatformAdapter):
+ 
+         self._mark_connected()
+         logger.info(
+-            "LINE: webhook listening on %s:%s%s%s",
++            "LINE: webhook listening on %s:%s — %d channel(s): %s%s",
+             self.webhook_host,
+             self.webhook_port,
+-            self.webhook_path,
++            len(self._channels),
++            ", ".join(f"{ch.profile}={ch.webhook_path}" for ch in self._channels.all()),
+             f" (public: {self.public_base_url})" if self.public_base_url else "",
+         )
+         return True
+@@ -1098,13 +1267,19 @@ class LineAdapter(BasePlatformAdapter):
+         self._media_temp_paths.clear()
+         self._media_tokens.clear()
+ 
+-        if self._lock_key:
+-            try:
+-                from gateway.status import release_scoped_lock
+-                release_scoped_lock("line", self._lock_key)
+-            except Exception:
+-                pass
+-            self._lock_key = None
++        try:
++            from gateway.status import release_scoped_lock
++            for ch in self._channels.all():
++                if ch.lock_key:
++                    try:
++                        release_scoped_lock("line", ch.lock_key)
++                    except Exception:
++                        pass
++                    ch.lock_key = None
++                ch.client = None
++                ch.bot_user_id = None
++        except ImportError:
++            pass
+ 
+     # ------------------------------------------------------------------
+     # Webhook handlers
+@@ -1117,6 +1292,19 @@ class LineAdapter(BasePlatformAdapter):
+     async def _handle_webhook(self, request) -> Any:
+         from aiohttp import web
+ 
++        # Which channel this route belongs to. Resolved by matching the
++        # concrete request path back against the registry (every channel's
++        # webhook_path is a literal string registered individually in
++        # connect() — no {profile} URL parameter involved), so signature
++        # verification below is always checked against the one channel
++        # this exact route was registered for, never an ambient default.
++        channel = self._channels.by_webhook_path(request.path)
++        if channel is None:
++            # Unreachable in practice — aiohttp only invokes this handler
++            # for paths connect() registered it against — but fail closed
++            # rather than fall back to some other channel's secret.
++            return web.Response(status=404, text="not found")
++
+         # Body cap defends against memory-exhaustion via crafted Content-Length
+         # (aiohttp's client_max_size only applies to certain body modes).
+         try:
+@@ -1128,7 +1316,7 @@ class LineAdapter(BasePlatformAdapter):
+             return web.Response(status=413, text="payload too large")
+ 
+         signature = request.headers.get("X-Line-Signature", "")
+-        if not verify_line_signature(body, signature, self.channel_secret):
++        if not verify_line_signature(body, signature, channel.channel_secret):
+             return web.Response(status=401, text="invalid signature")
+ 
+         try:
+@@ -1137,11 +1325,19 @@ class LineAdapter(BasePlatformAdapter):
+             return web.Response(status=400, text="bad json")
+ 
+         events = payload.get("events", []) or []
+-        for event in events:
+-            try:
+-                await self._dispatch_event(event)
+-            except Exception:
+-                logger.exception("LINE: dispatch_event failed")
++        # Scope every event in this batch to `channel` — a single webhook
++        # POST is always one channel's events. Reset in `finally` so a
++        # slow/failed dispatch can never leak `channel` into whatever this
++        # aiohttp worker handles next.
++        token = line_multiplex.set_current(channel)
++        try:
++            for event in events:
++                try:
++                    await self._dispatch_event(event)
++                except Exception:
++                    logger.exception("LINE: dispatch_event failed")
++        finally:
++            line_multiplex.reset_current(token)
+ 
+         return web.Response(status=200, text="ok")
+ 
+@@ -1155,9 +1351,25 @@ class LineAdapter(BasePlatformAdapter):
+             logger.debug("LINE: ignoring duplicate webhook event %s", webhook_event_id)
+             return
+ 
++        # Remember which channel this chat belongs to, for outbound sends.
++        # Deliberately not the contextvar alone: handle_message() (called
++        # further down this dispatch, for message events) spawns a
++        # background task for the agent turn, so by the time a reply is
++        # ready to send, this request's context may no longer be current.
++        # See line_multiplex's module docstring.
++        current_channel = line_multiplex.current()
++        if current_channel is not None:
++            _chat_id_for_memo, _ = _resolve_chat(source)
++            if _chat_id_for_memo:
++                self._channels.remember_chat(_chat_id_for_memo, current_channel)
++
+         # Filter our own messages (self-echo).
+         sender_user_id = source.get("userId", "")
+-        if self._bot_user_id and sender_user_id == self._bot_user_id:
++        if (
++            current_channel is not None
++            and current_channel.bot_user_id
++            and sender_user_id == current_channel.bot_user_id
++        ):
+             return
+ 
+         # Allowlist gate. DMs (source type "user") that aren't already
+@@ -1339,6 +1551,17 @@ class LineAdapter(BasePlatformAdapter):
+             user_name=user_id,
+             chat_name=chat_id,
+         )
++        # Stamp which channel/profile this turn belongs to. Downstream
++        # (gateway/run.py's _resolve_profile_home_for_source) reads this
++        # one field to enter the right profile's config/skills/memory
++        # scope — the multiplexer's own generic mechanism, unchanged by
++        # this patch. build_source() may have already resolved a profile
++        # via gateway.profile_routes (shared-credential routing, not
++        # applicable to LINE's per-credential channels); the channel this
++        # webhook route was registered for is authoritative and wins.
++        current_channel = line_multiplex.current()
++        if current_channel is not None:
++            source_obj.profile = current_channel.profile
+ 
+         event_obj = MessageEvent(
+             text=text,
+@@ -1448,7 +1671,8 @@ class LineAdapter(BasePlatformAdapter):
+         reply_to: Optional[str] = None,
+         metadata: Optional[Dict[str, Any]] = None,
+     ) -> SendResult:
+-        if not self._client:
++        channel = self._channel_for_send(chat_id)
++        if channel is None or channel.client is None:
+             return SendResult(success=False, error="LINE adapter not connected")
+ 
+         # System busy-acks (interrupting / queued / steered) bypass the
+@@ -1473,8 +1697,13 @@ class LineAdapter(BasePlatformAdapter):
+         *,
+         force_push: bool,
+     ) -> SendResult:
+-        if not self._client:
++        # NOT self._client — see the block comment above the multi-channel
++        # resolution properties. This runs from handle_message()'s
++        # background task, outside the inbound request's context.
++        channel = self._channel_for_send(chat_id)
++        if channel is None or channel.client is None:
+             return SendResult(success=False, error="LINE adapter not connected")
++        client = channel.client
+ 
+         chunks = split_for_line(strip_markdown_preserving_urls(content))
+         if not chunks:
+@@ -1484,14 +1713,14 @@ class LineAdapter(BasePlatformAdapter):
+         token, used_reply = self._consume_reply_token(chat_id)
+         if used_reply and not force_push:
+             try:
+-                await self._client.reply(token, messages)
++                await client.reply(token, messages)
+                 return SendResult(success=True, message_id=token)
+             except Exception as exc:
+                 logger.info("LINE: reply token rejected (%s); falling back to push", exc)
+                 # fall through to push
+ 
+         try:
+-            await self._client.push(chat_id, messages)
++            await client.push(chat_id, messages)
+             return SendResult(success=True, message_id=None)
+         except Exception as exc:
+             logger.error("LINE: push send failed: %s", exc)
+@@ -1512,8 +1741,9 @@ class LineAdapter(BasePlatformAdapter):
+ 
+     async def send_typing(self, chat_id: str, metadata=None) -> None:
+         """Trigger LINE's loading-animation indicator (DM only)."""
+-        if self._client and chat_id:
+-            await self._client.loading(chat_id)
++        channel = self._channel_for_send(chat_id) if chat_id else None
++        if channel is not None and channel.client is not None:
++            await channel.client.loading(chat_id)
+ 
+     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+         """Best-effort chat info derived from the chat_id prefix.
+@@ -1542,9 +1772,11 @@ class LineAdapter(BasePlatformAdapter):
+         responsible for the typing-indicator heartbeat, while *this*
+         wrapper layers in the slow-LLM postback bubble at threshold.
+         """
++        channel = self._channel_for_send(chat_id) if chat_id else None
+         if (
+             self.slow_response_threshold <= 0
+-            or not self._client
++            or channel is None
++            or channel.client is None
+             or not chat_id
+         ):
+             await super()._keep_typing(chat_id, *args, **kwargs)
+@@ -1571,7 +1803,7 @@ class LineAdapter(BasePlatformAdapter):
+                 self.pending_text, self.button_label, rid
+             )
+             try:
+-                await self._client.reply(token, [msg])
++                await channel.client.reply(token, [msg])
+                 logger.info("LINE: sent slow-LLM postback button for chat %s (rid=%s)", chat_id, rid)
+             except Exception as exc:
+                 logger.warning("LINE: postback button send failed: %s", exc)
+@@ -1694,7 +1926,7 @@ class LineAdapter(BasePlatformAdapter):
+             return SendResult(success=False, error=f"image file not found: {image_path}")
+         if path.stat().st_size > LINE_IMAGE_MAX_BYTES:
+             return SendResult(success=False, error="image exceeds 10 MB LINE limit")
+-        if not self._client:
++        if self._channel_for_send(chat_id) is None:
+             return SendResult(success=False, error="LINE adapter not connected")
+         if not self.public_base_url and self.webhook_host == "0.0.0.0":
+             return SendResult(
+@@ -1724,7 +1956,7 @@ class LineAdapter(BasePlatformAdapter):
+             return SendResult(success=False, error=f"audio file not found: {audio_path}")
+         if path.stat().st_size > LINE_AV_MAX_BYTES:
+             return SendResult(success=False, error="audio exceeds 200 MB LINE limit")
+-        if not self._client:
++        if self._channel_for_send(chat_id) is None:
+             return SendResult(success=False, error="LINE adapter not connected")
+         if not self.public_base_url and self.webhook_host == "0.0.0.0":
+             return SendResult(
+@@ -1748,7 +1980,7 @@ class LineAdapter(BasePlatformAdapter):
+             return SendResult(success=False, error=f"video file not found: {video_path}")
+         if path.stat().st_size > LINE_AV_MAX_BYTES:
+             return SendResult(success=False, error="video exceeds 200 MB LINE limit")
+-        if not self._client:
++        if self._channel_for_send(chat_id) is None:
+             return SendResult(success=False, error="LINE adapter not connected")
+         if not self.public_base_url and self.webhook_host == "0.0.0.0":
+             return SendResult(
+@@ -1787,8 +2019,14 @@ class LineAdapter(BasePlatformAdapter):
+         messages: List[Dict[str, Any]],
+     ) -> SendResult:
+         """Send already-built message objects, batched at 5/call."""
+-        if not self._client:
++        # NOT self._client — see the block comment above the multi-channel
++        # resolution properties. send_image_file/send_voice/send_video all
++        # funnel through here, and none of them are guaranteed to still be
++        # inside the inbound request's context by the time they run.
++        channel = self._channel_for_send(chat_id)
++        if channel is None or channel.client is None:
+             return SendResult(success=False, error="LINE adapter not connected")
++        client = channel.client
+         if not messages:
+             return SendResult(success=True, message_id=None)
+ 
+@@ -1799,16 +2037,16 @@ class LineAdapter(BasePlatformAdapter):
+         token, used_reply = self._consume_reply_token(chat_id)
+         if used_reply:
+             try:
+-                await self._client.reply(token, first_batch)
++                await client.reply(token, first_batch)
+             except Exception as exc:
+                 logger.info("LINE: reply token rejected (%s); falling back to push", exc)
+                 try:
+-                    await self._client.push(chat_id, first_batch)
++                    await client.push(chat_id, first_batch)
+                 except Exception as exc2:
+                     return SendResult(success=False, error=str(exc2))
+         else:
+             try:
+-                await self._client.push(chat_id, first_batch)
++                await client.push(chat_id, first_batch)
+             except Exception as exc:
+                 return SendResult(success=False, error=str(exc))
+ 
+@@ -1817,7 +2055,7 @@ class LineAdapter(BasePlatformAdapter):
+             batch = rest[:LINE_MAX_MESSAGES_PER_CALL]
+             rest = rest[LINE_MAX_MESSAGES_PER_CALL:]
+             try:
+-                await self._client.push(chat_id, batch)
++                await client.push(chat_id, batch)
+             except Exception as exc:
+                 logger.warning("LINE: push for follow-up batch failed: %s", exc)
+                 return SendResult(success=False, error=str(exc))
+diff --git a/plugins/platforms/line/plugin.yaml b/plugins/platforms/line/plugin.yaml
+index 45c624a..81c0e9e 100644
+--- a/plugins/platforms/line/plugin.yaml
++++ b/plugins/platforms/line/plugin.yaml
+@@ -79,3 +79,26 @@ optional_env:
+     description: "After the bot answers an @mention in a group, that same user may follow up without mentioning again for this many seconds (default: 90; 0 disables). Also the only path by which stickers/images in a group are processed, since LINE attaches mention data to text messages only."
+     prompt: "Mention follow-up window (seconds)"
+     password: false
++# Additional LINE channels (distinct Developers Console bot registrations)
++# for this same gateway process — NOT representable via env, unlike every
++# knob above. Set as a structured list under `platforms.line.extra.channels`
++# in config.yaml, e.g.:
++#
++#   platforms:
++#     line:
++#       extra:
++#         channels:
++#           - profile: coder            # must match an existing gateway
++#                                        # profile name; "default" is reserved
++#             channel_access_token: "..."
++#             channel_secret: "..."
++#             allowed_users: ["Uxxxxxxxx"]
++#             dm_policy: pairing        # optional, defaults to "pairing"
++#
++# Each additional channel gets its own webhook route
++# (/line/p/<profile>/webhook — the default channel keeps the unprefixed
++# /line/webhook unchanged) and its own allowlists/dm_policy, fully isolated
++# from every other configured channel. Register that URL as that channel's
++# webhook endpoint in its own LINE Developers Console entry.
++# See modules/line/line_multiplex.py and plans/line-multi-channel-plan.md
++# in the hermes-render repo for the full design.
