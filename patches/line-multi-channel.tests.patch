@@ -1,5 +1,5 @@
 diff --git a/tests/gateway/test_line_plugin.py b/tests/gateway/test_line_plugin.py
-index af207ce..3fd2fb3 100644
+index af207ce..604e095 100644
 --- a/tests/gateway/test_line_plugin.py
 +++ b/tests/gateway/test_line_plugin.py
 @@ -25,6 +25,22 @@ import pytest
@@ -46,7 +46,7 @@ index af207ce..3fd2fb3 100644
          token = adapter._invites.mint("Jamie", "Umanager")
  
          from gateway.pairing import PairingStore
-@@ -1047,3 +1068,549 @@ class TestDispatchEventInviteRedemption:
+@@ -1047,3 +1068,668 @@ class TestDispatchEventInviteRedemption:
  
          from gateway.pairing import PairingStore
          assert PairingStore().is_approved("line", "Ucandidate") is True
@@ -596,3 +596,122 @@ index af207ce..3fd2fb3 100644
 +        adapter._unregister_from_profile_adapters()  # must not raise on the second call
 +
 +        assert runner._profile_adapters.get("coder", {}) == {}
++
++
++class TestPairingStoreSharing:
++    """Regression coverage for a second real bug found live on
++    2026-08-02, right after fixing TestProfileAdapterRegistration above:
++    approving a pairing code exactly as instructed did not authorize the
++    next message. Root cause: gateway/pairing.py's module-level
++    PAIRING_DIR is resolved once, at import time, from the default
++    profile's HERMES_HOME — `hermes pairing approve` has no --profile
++    flag and structurally can't target a per-profile store, so an
++    approval always lands in the one global PairingStore. But
++    _register_in_profile_adapters (previous fix) has the side effect of
++    making a channel's profile show up in runner._profile_adapters,
++    which gateway/run.py's own bookkeeping uses to decide which profiles
++    get an ISOLATED PairingStore in runner.pairing_stores — correct for
++    a genuinely separate-credentialed secondary profile, wrong for LINE
++    channels here, which share one global store by design (research/08:
++    LINE IDs are already channel-scoped, no collision risk)."""
++
++    def _make_adapter(self, monkeypatch, **extra):
++        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "default-token")
++        monkeypatch.setenv("LINE_CHANNEL_SECRET", "default-secret")
++        from gateway.config import PlatformConfig
++        return LineAdapter(
++            PlatformConfig(
++                enabled=True,
++                extra={
++                    "channels": [
++                        {
++                            "profile": "coder",
++                            "channel_secret": "s",
++                            "channel_access_token": "t",
++                        }
++                    ],
++                    **extra,
++                },
++            )
++        )
++
++    def test_share_points_the_new_channel_at_the_global_store(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch)
++        runner = MagicMock()
++        runner.pairing_stores = {}
++        global_store = MagicMock(name="global_pairing_store")
++        runner.pairing_store = global_store
++        adapter.gateway_runner = runner
++
++        adapter._share_pairing_store_across_channels()
++
++        assert runner.pairing_stores["coder"] is global_store
++
++    def test_share_does_not_touch_the_default_profile_key(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch)
++        runner = MagicMock()
++        runner.pairing_stores = {}
++        runner.pairing_store = MagicMock()
++        adapter.gateway_runner = runner
++
++        adapter._share_pairing_store_across_channels()
++
++        assert "default" not in runner.pairing_stores
++
++    def test_share_overwrites_an_isolated_store_the_generic_bookkeeping_already_made(self, monkeypatch):
++        # Simulates gateway/run.py's own bookkeeping having already run
++        # first (order-independence: our fix must win regardless of
++        # which side runs first).
++        adapter = self._make_adapter(monkeypatch)
++        runner = MagicMock()
++        isolated_store = MagicMock(name="isolated_per_profile_store")
++        runner.pairing_stores = {"coder": isolated_store}
++        global_store = MagicMock(name="global_pairing_store")
++        runner.pairing_store = global_store
++        adapter.gateway_runner = runner
++
++        adapter._share_pairing_store_across_channels()
++
++        assert runner.pairing_stores["coder"] is global_store
++        assert runner.pairing_stores["coder"] is not isolated_store
++
++    def test_share_is_a_safe_no_op_without_a_gateway_runner(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch)
++        adapter.gateway_runner = None
++        adapter._share_pairing_store_across_channels()  # must not raise
++
++    def test_share_is_a_safe_no_op_with_a_bare_runner(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch)
++        adapter.gateway_runner = MagicMock(spec=[])  # no pairing_store(s) attrs
++        adapter._share_pairing_store_across_channels()  # must not raise
++
++    def test_share_is_a_safe_no_op_when_global_store_is_none(self, monkeypatch):
++        adapter = self._make_adapter(monkeypatch)
++        runner = MagicMock()
++        runner.pairing_stores = {}
++        runner.pairing_store = None
++        adapter.gateway_runner = runner
++        adapter._share_pairing_store_across_channels()  # must not raise
++        assert "coder" not in runner.pairing_stores
++
++    def test_bookkeeping_running_AFTER_our_fix_must_not_overwrite_it(self, monkeypatch):
++        # The real order in production: our connect() runs first (primary
++        # profile startup), THEN gateway/run.py's own
++        # `if name not in self.pairing_stores: ...` bookkeeping runs.
++        # Simulate that exact sequence end to end.
++        adapter = self._make_adapter(monkeypatch)
++        runner = MagicMock()
++        runner.pairing_stores = {}
++        global_store = MagicMock(name="global_pairing_store")
++        runner.pairing_store = global_store
++        adapter.gateway_runner = runner
++
++        adapter._share_pairing_store_across_channels()
++
++        # gateway/run.py's real bookkeeping shape:
++        served = ["default", "coder"]
++        for name in served:
++            if name and name not in runner.pairing_stores:
++                runner.pairing_stores[name] = MagicMock(name=f"fresh_store_for_{name}")
++
++        assert runner.pairing_stores["coder"] is global_store
