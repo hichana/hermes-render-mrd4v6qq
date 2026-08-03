@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-31
 **Question asked:** Should NGraph keep building client agents on Hermes Agent, or move to something like LangChain's Deep Agents?
-**Status:** Research complete. Recommendation in [`06-recommendation.md`](06-recommendation.md).
+**Status:** Research complete. Recommendation in [`06-recommendation.md`](06-recommendation.md), reaffirmed with a new framework candidate in [`09`](09-pydantic-ai-and-collaboration-transparency.md).
 
 ---
 
@@ -18,6 +18,7 @@
 | [`06-recommendation.md`](06-recommendation.md) | The call, the reasoning, and the triggers that would change it |
 | [`07-line-multi-channel-multiplexing.md`](07-line-multi-channel-multiplexing.md) | Separate follow-up question (2026-08-01): can `gateway.multiplex_profiles` give each client agent its own LINE channel? Not as shipped — source-verified. Given our single-container Render deployment can't absorb N separate gateway processes (measured: ~262 MB RSS per idle gateway process against a 2 GiB container), recommendation is to patch LINE for real multi-channel support rather than sidestep multiplexing. |
 | [`08-line-multi-channel-patch-scope.md`](08-line-multi-channel-patch-scope.md) | Concrete scope for that patch: a `SessionSource.profile`-stamping mechanism the multiplexer already provides generically turns out to do most of the hard work, so the patch can follow `line-group-mention.patch`'s thin-call-outs-plus-testable-module shape rather than a full adapter rewrite. Includes exactly what changes in `UPGRADING.md`'s preflight manifest, smoke test, and Phase 5 checklist once this patch exists. **Built as [`plans/line-multi-channel-plan.md`](../plans/line-multi-channel-plan.md), 2026-08-01** — locally validated (120 adapter-level tests + full local Docker build/smoke-test pass), not yet deployed. |
+| [`09-pydantic-ai-and-collaboration-transparency.md`](09-pydantic-ai-and-collaboration-transparency.md) | Follow-up question (2026-08-02): Matt raised two new arguments for rebuilding — patch-based development leaves him unable to co-develop with Claude directly, and Hermes' guardrail gaps are a bad fit for our multi-tenant use case. Evaluates Pydantic AI as the Phase 4 framework candidate and traces the collaboration-transparency complaint to its source (100% of patched code is the LINE adapter layer, none of it the agent loop). **Conclusion: doesn't overturn `06` — Option D's Phase 1 already fixes the co-development pain, independent of any framework choice, and Pydantic AI becomes the named front-runner for the Phase 4 decision `06` already deferred.** Also corrects the proposed mechanic: not a subfolder move, a new separate service alongside this repo. |
 
 ## Inputs that shaped the analysis
 
